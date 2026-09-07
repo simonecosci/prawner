@@ -406,10 +406,182 @@ parse_args() {
   fi
 }
 
-clean_site() {
-  log "  prefix=$PREFIX uploads=$UPLOADS_DIR owner=$SITE_OWNER:$SITE_GROUP"
-  return 0
+# -------------------------------------------------------------- classify
+
+# Prints the names that the haystack does mention. A single grep -F -f pass:
+# GNU grep compiles the pattern file into an Aho-Corasick automaton, so
+# thousands of filenames cost one scan of the haystack, not one scan each.
+used_names() {
+  grep -oF -f "$WORK/names.txt" "$WORK/haystack.txt" 2>/dev/null | sort -u
 }
+
+classify() {
+  used_names > "$WORK/used-names.txt"
+  : > "$WORK/doomed-attachments.tsv"
+  : > "$WORK/doomed-orphans.txt"
+  : > "$WORK/doomed-thumbs.txt"
+
+  local cutoff
+  cutoff=$(date -d "-${MIN_AGE_DAYS} days" '+%Y-%m-%d %H:%M:%S')
+
+  # --- attachments
+  if [[ "$ONLY_CLASS" == "all" || "$ONLY_CLASS" == "attachments" ]]; then
+    local id pdate parent rel base
+    while IFS=$'\t' read -r id pdate parent rel; do
+      [[ -n "$id" ]] || continue
+      [[ "$pdate" < "$cutoff" ]] || continue
+      [[ $KEEP_ATTACHED -eq 0 || "$parent" == "0" ]] || continue
+      base=$(basename "$rel")
+      name_is_used "$base" && continue
+      grep -qxF "$id" "$WORK/ids.txt" && continue
+      printf '%s\t%s\n' "$id" "$rel" >> "$WORK/doomed-attachments.tsv"
+    done < "$WORK/inventory.tsv"
+  fi
+
+  # --- files on disk
+  # Everything that legitimately belongs to an attachment, as bare filenames.
+  # sed rather than `xargs basename`: uploads with spaces in the name are
+  # common and xargs would split them into pieces.
+  sed 's|.*/||' < <(cut -f4 "$WORK/inventory.tsv") | sort -u > "$WORK/known-files.txt"
+  cut -f3 "$WORK/sizemap.tsv"   | sort -u >> "$WORK/known-files.txt"
+  sort -u -o "$WORK/known-files.txt" "$WORK/known-files.txt"
+
+  # Size names still registered, plus the pseudo name for the untouched
+  # original of a -scaled upload, which is never a stale thumbnail.
+  cp "$WORK/registered.txt" "$WORK/live-sizes.txt"
+  printf '__original\n' >> "$WORK/live-sizes.txt"
+
+  # filename -> size name, for the thumbnails the metadata knows about.
+  awk -F'\t' '{ print $3 "\t" $2 }' "$WORK/sizemap.tsv" | sort -u > "$WORK/file-to-size.tsv"
+
+  local f fname canon sizename tbase text
+  while IFS= read -r f; do
+    fname=$(basename "$f")
+
+    # Referenced by name anywhere? Then it stays, whatever it is. This is what
+    # protects srcset candidates for sizes that are no longer registered.
+    name_is_used "$fname" && continue
+
+    if grep -qxF "$fname" "$WORK/known-files.txt"; then
+      # Known to WordPress. Only a thumbnail stored under a size name that is
+      # no longer registered can go.
+      [[ "$ONLY_CLASS" == "all" || "$ONLY_CLASS" == "thumbs" ]] || continue
+      parse_thumb_size "$fname" >/dev/null || continue
+      sizename=$(awk -F'\t' -v n="$fname" '$1 == n { print $2; exit }' "$WORK/file-to-size.tsv")
+      [[ -n "$sizename" ]] || continue
+      grep -qxF "$sizename" "$WORK/live-sizes.txt" && continue
+      printf '%s\n' "$f" >> "$WORK/doomed-thumbs.txt"
+      continue
+    fi
+
+    # Unknown to WordPress. A -scaled / -rotated / -e<timestamp> variant of a
+    # known upload is not an orphan.
+    canon=$(canonical_original "$fname")
+    if [[ "$canon" != "$fname" ]] && grep -qxF "$canon" "$WORK/known-files.txt"; then
+      continue
+    fi
+
+    # A generated size of a live attachment that the metadata has forgotten:
+    # a leftover from an earlier regeneration.
+    if IFS='|' read -r tbase _ text < <(parse_thumb_size "$fname"); then
+      if grep -qxF "$tbase.$text" "$WORK/known-files.txt"; then
+        [[ "$ONLY_CLASS" == "all" || "$ONLY_CLASS" == "thumbs" ]] || continue
+        printf '%s\n' "$f" >> "$WORK/doomed-thumbs.txt"
+        continue
+      fi
+    fi
+
+    [[ "$ONLY_CLASS" == "all" || "$ONLY_CLASS" == "orphans" ]] || continue
+    printf '%s\n' "$f" >> "$WORK/doomed-orphans.txt"
+  done < <(find "$UPLOADS_DIR" -type f 2>/dev/null)
+}
+
+# ---------------------------------------------------------------- report
+
+# Total bytes of the paths listed on stdin.
+bytes_of() {
+  local total=0 f sz
+  while IFS= read -r f; do
+    sz=$(stat -c %s "$f" 2>/dev/null) || continue
+    total=$((total + sz))
+  done
+  printf '%s\n' "$total"
+}
+
+human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || printf '%sB\n' "${1:-0}"; }
+
+report() {
+  local n_att n_orph n_thumb b_att b_orph b_thumb
+
+  n_att=$(wc -l < "$WORK/doomed-attachments.tsv")
+  n_orph=$(wc -l < "$WORK/doomed-orphans.txt")
+  n_thumb=$(wc -l < "$WORK/doomed-thumbs.txt")
+
+  # An attachment costs its original plus every generated size.
+  cut -f2 "$WORK/doomed-attachments.tsv" \
+    | sed "s|^|$UPLOADS_DIR/|" > "$WORK/att-files.txt"
+  local id rel dir
+  while IFS=$'\t' read -r id rel; do
+    dir=$(dirname "$rel")
+    awk -F'\t' -v i="$id" '$1 == i { print $3 }' "$WORK/sizemap.tsv" \
+      | sed "s|^|$UPLOADS_DIR/$dir/|" >> "$WORK/att-files.txt"
+  done < "$WORK/doomed-attachments.tsv"
+
+  b_att=$(bytes_of   < "$WORK/att-files.txt")
+  b_orph=$(bytes_of  < "$WORK/doomed-orphans.txt")
+  b_thumb=$(bytes_of < "$WORK/doomed-thumbs.txt")
+
+  log "  attachments: $n_att ($(human "$b_att"))"
+  log "  orphan files: $n_orph ($(human "$b_orph"))"
+  log "  stale thumbs: $n_thumb ($(human "$b_thumb"))"
+  log "  reclaimable: $(human $((b_att + b_orph + b_thumb)))"
+
+  # The console shows a sample; the log keeps the lot.
+  {
+    printf '\n--- attachments\n'; cat "$WORK/doomed-attachments.tsv"
+    printf '\n--- orphan files\n'; cat "$WORK/doomed-orphans.txt"
+    printf '\n--- stale thumbs\n'; cat "$WORK/doomed-thumbs.txt"
+  } >> "$LOG_FILE"
+
+  if [[ $APPLY -eq 0 ]]; then
+    cut -f2 "$WORK/doomed-attachments.tsv" | head -5 | sed 's/^/    /'
+    head -5 "$WORK/doomed-orphans.txt" | sed 's/^/    /'
+    printf '  %sfull list in %s%s\n' "$c_dim" "$LOG_FILE" "$c_off"
+  fi
+}
+
+# ------------------------------------------------------------- per site
+
+clean_site() {
+  WORK=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '$WORK'" RETURN
+
+  collect_inventory
+  collect_size_map
+  collect_registered_sizes
+  collect_names
+  collect_haystack
+  collect_id_set
+
+  if [[ ! -s "$WORK/inventory.tsv" ]]; then
+    log "  no attachment found, nothing to do"
+    return 0
+  fi
+  if [[ ! -s "$WORK/haystack.txt" ]]; then
+    warn "  refusing to classify with an empty haystack"
+    return 1
+  fi
+
+  classify
+  report
+
+  [[ $APPLY -eq 1 ]] || return 0
+  quarantine_site
+}
+
+# Temporary stub; Task 7 replaces this with the real quarantine move.
+quarantine_site() { warn "  --apply not implemented yet"; return 0; }
 
 main() {
   parse_args "$@"
