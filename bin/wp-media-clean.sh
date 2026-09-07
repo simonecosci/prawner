@@ -47,6 +47,54 @@ ok()   { printf '%s[ok]%s %s\n' "$c_grn" "$c_off" "$*"; }
 info() { printf '  %s\n' "$*"; }
 log()  { printf '%s\n' "$*"; [[ -n "$LOG_FILE" ]] && printf '%s  %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE"; return 0; }
 
+# ------------------------------------------------------- filename helpers
+# Pure string functions. tests/run.sh sources this file and exercises them
+# directly, so they must not touch global state or the filesystem.
+
+# parse_thumb_size <filename>
+# Recognises a WordPress generated size variant, "photo-800x600.jpg", and
+# prints "<base>|<WxH>|<ext>". Returns 1 for anything else. The size has to sit
+# at the very end of the name: "photo-800x600-detail.jpg" is a user filename
+# that happens to contain digits, not a generated size.
+parse_thumb_size() {
+  local name="$1"
+  [[ "$name" =~ ^(.+)-([0-9]+x[0-9]+)\.([A-Za-z0-9]+)$ ]] || return 1
+  printf '%s|%s|%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+}
+
+# canonical_original <filename>
+# WordPress keeps several files per upload that are not thumbnails: oversized
+# uploads become "<name>-scaled.<ext>" with the untouched "<name>.<ext>" left
+# on disk, and the image editor writes "<name>-e<timestamp>.<ext>" and
+# "<name>-rotated.<ext>". Strips such a suffix so the caller can check whether
+# the file belongs to a known upload. The six digit floor on the -e form keeps
+# ordinary filenames such as "phone-e5.jpg" intact.
+canonical_original() {
+  local name="$1"
+  if [[ "$name" =~ ^(.+)-(scaled|rotated|e[0-9]{6,})\.([A-Za-z0-9]+)$ ]]; then
+    printf '%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}"
+  else
+    printf '%s\n' "$name"
+  fi
+}
+
+# urlencode_name <filename>
+# Percent-encodes a filename so that a reference written as "my%20photo.jpg"
+# still matches the upload "my photo.jpg". LC_ALL=C makes the loop iterate over
+# bytes rather than characters, which is what UTF-8 percent-encoding needs.
+urlencode_name() {
+  local LC_ALL=C
+  local s="$1" out="" c hex i
+  for (( i = 0; i < ${#s}; i++ )); do
+    c="${s:i:1}"
+    case "$c" in
+      [A-Za-z0-9._~-]) out+="$c" ;;
+      *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+    esac
+  done
+  printf '%s\n' "$out"
+}
+
 usage() {
   # Extract header comments from shebang to first non-comment line.
   # Using awk is safer than a fixed line range, which breaks if the header
