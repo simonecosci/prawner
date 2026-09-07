@@ -106,16 +106,46 @@ use". That is the acceptable direction of error.
 ### The inventory
 
 A join of `posts` and `postmeta._wp_attached_file` over
-`post_type='attachment'`, yielding ID, upload date and path relative to the
-uploads base directory.
+`post_type='attachment'`, yielding ID, upload date, `post_parent` and the path
+relative to the uploads base directory.
+
+### The size map
+
+The inventory alone does not say which files on disk legitimately belong to an
+attachment. That information lives in `_wp_attachment_metadata`, which is
+serialized PHP, so it is read with a short inline `wp eval` that emits TSV of
+`attachment_id`, `size_name`, `filename`, plus one row per attachment carrying
+the `original_image` value under the pseudo size name `__original`.
+
+**Comparing generated dimensions against registered dimensions is wrong and
+must not be done.** `wp media image-size` reports the *requested* bounding box,
+while the generated filename carries the *actual* dimensions after the aspect
+ratio is preserved: an uncropped `large` size of 1024x1024 applied to a
+1600x900 upload produces `photo-1024x576.jpg`, and `1024x576` appears in no
+list of registered sizes. Comparing that way would report nearly every
+uncropped thumbnail as stale.
+
+The comparison is therefore made on **size names**: the names present in the
+attachment's metadata are checked against the names listed by
+`wp media image-size --format=csv`.
+
+### Upload variants
+
+WordPress stores oversized uploads as `<name>-scaled.<ext>` and points
+`_wp_attached_file` at that file while keeping `<name>.<ext>` on disk, recorded
+in the `original_image` metadata key. The image editor likewise produces
+`<name>-e<timestamp>.<ext>` and `<name>-rotated.<ext>`. None of these are
+thumbnails and none may be reported as orphan files: a file whose name reduces
+to a known attached file after stripping a `-scaled`, `-rotated` or
+`-e<timestamp>` suffix is considered in use.
 
 ### Classification
 
 | Class | Removable when |
 |---|---|
 | Orphan attachment | its basename is absent from the haystack **and** its ID is absent from the ID set **and** it is older than `--min-age` (default 30 days) **and**, if `--keep-attached` was given, `post_parent = 0` |
-| Orphan file | it lives under `uploads/`, is not the `_wp_attached_file` of any attachment, is not a thumbnail derived from one, and its name is absent from the haystack |
-| Stale thumbnail | it is `<base>-<W>x<H>.<ext>` of a live attachment, `WxH` is not among the sizes reported by `wp media image-size`, **and** its filename is absent from the haystack |
+| Orphan file | it lives under `uploads/`, is not the `_wp_attached_file` of any attachment, is not listed in any attachment's size map, is not an upload variant of a known attached file, and its name is absent from the haystack |
+| Stale thumbnail | it is `<base>-<W>x<H>.<ext>` whose base belongs to a live attachment, and either it is absent from that attachment's size map (a leftover from an earlier regeneration) or the size *name* it is stored under is no longer registered, **and** its filename is absent from the haystack |
 
 `post_parent` is deliberately not a criterion by default. An image uploaded
 through a post's editor and later removed from the content keeps its
@@ -229,7 +259,7 @@ Environment overrides, consistent with the rest of the repository:
 `WP_CLI_CACHE_ROOT`.
 
 The report prints, per site and per class, the number of items and the
-reclaimable bytes, plus the largest entries; the complete list goes to the log
+reclaimable bytes, plus a short sample; the complete list goes to the log
 file. Exit status is non-zero if any site failed.
 
 ## Repository changes
