@@ -24,7 +24,7 @@ BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/wp-site}"
 WP_CLI_CACHE_ROOT="${WP_CLI_CACHE_ROOT:-/var/cache/wp-cli}"
 DEFAULT_OWNER="${DEFAULT_OWNER:-www-data}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-}"
-WP_LOCALE="${WP_LOCALE:-it_IT}"
+WP_LOCALE="${WP_LOCALE:-en_US}"
 
 c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
 

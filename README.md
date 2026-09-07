@@ -125,7 +125,7 @@ Every convention can be overridden to fit different setups:
 | `BACKUP_ROOT`        | `/var/backups/wp-site`                   |
 | `WP_CLI_CACHE_ROOT`  | `/var/cache/wp-cli`                      |
 | `DEFAULT_OWNER`      | `www-data`                               |
-| `WP_LOCALE`          | `it_IT` — locale of the WordPress installed by `create` |
+| `WP_LOCALE`          | `en_US` — locale of the WordPress installed by `create` |
 | `ADMIN_EMAIL`        | *(empty)* — default admin email for `create`/`cert` |
 
 ## wp-update.sh — automatic updates

@@ -13,6 +13,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `/etc/cron.d/wp-update` (with `flock` to prevent overlapping runs).
 - `install.sh --with-cron` / `uninstall.sh --with-cron`: install/remove the
   `wp-update.sh` cron job along with the commands.
+- `WP_LOCALE`: locale of the WordPress installed by `wp-site.sh create`,
+  previously hardcoded.
+
+### Changed
+- Documentation, comments and runtime messages are now in English.
+- `wp-site.sh create` installs WordPress in `en_US` instead of `it_IT`. Set
+  `WP_LOCALE=it_IT` to keep the previous behaviour.
+- The DNS mismatch prompt of `wp-site.sh create` is now `[y/N]` and no longer
+  accepts `s` as confirmation.
 
 ## [1.0.0] - 2026-09-07
 
