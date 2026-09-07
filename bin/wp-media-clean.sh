@@ -234,6 +234,127 @@ for_each_site() {
   return 0
 }
 
+# ---------------------------------------------------------- data collection
+
+# One query per source rather than a single UNION: termmeta is missing on very
+# old installations and a plugin can leave a table unreadable, and neither
+# should cost us the whole haystack.
+collect_haystack() {
+  local out="$WORK/haystack.txt" q
+  : > "$out"
+  local -a queries=(
+    "SELECT post_content FROM ${PREFIX}posts WHERE post_type <> 'attachment'"
+    "SELECT post_excerpt FROM ${PREFIX}posts WHERE post_type <> 'attachment'"
+    "SELECT meta_value FROM ${PREFIX}postmeta WHERE meta_key NOT IN ('_wp_attached_file','_wp_attachment_metadata','_wp_attachment_backup_sizes')"
+    "SELECT option_value FROM ${PREFIX}options"
+    "SELECT meta_value FROM ${PREFIX}termmeta"
+    "SELECT meta_value FROM ${PREFIX}usermeta"
+  )
+  for q in "${queries[@]}"; do
+    wp_run db query "$q" --skip-column-names >> "$out" \
+      || warn "  a haystack query failed, continuing: ${q:0:60}..."
+  done
+
+  # No post_status filter above: drafts, revisions, scheduled posts and the
+  # trash all count as references, which is what protects work in progress.
+
+  if [[ $SCAN_FILES -eq 1 ]]; then
+    local d
+    for d in themes plugins mu-plugins; do
+      [[ -d "$SITE_PATH/wp-content/$d" ]] || continue
+      grep -rIoh -f "$WORK/names.txt" "$SITE_PATH/wp-content/$d" 2>/dev/null >> "$out"
+    done
+  fi
+
+  [[ -s "$out" ]] || warn "  the haystack is empty: every attachment would look unused"
+}
+
+collect_inventory() {
+  wp_run db query "
+    SELECT p.ID, p.post_date, p.post_parent, m.meta_value
+    FROM ${PREFIX}posts p
+    JOIN ${PREFIX}postmeta m ON m.post_id = p.ID AND m.meta_key = '_wp_attached_file'
+    WHERE p.post_type = 'attachment'
+  " --skip-column-names > "$WORK/inventory.tsv"
+}
+
+# _wp_attachment_metadata is serialized PHP, which bash parses badly, so this
+# is the one place the script runs PHP. It emits the authoritative map of the
+# files that legitimately belong to each attachment.
+collect_size_map() {
+  wp_run eval '
+    global $wpdb;
+    $ids = $wpdb->get_col( "SELECT ID FROM {$wpdb->posts} WHERE post_type = \"attachment\"" );
+    foreach ( $ids as $id ) {
+      $m = wp_get_attachment_metadata( $id );
+      if ( ! is_array( $m ) ) { continue; }
+      if ( ! empty( $m["original_image"] ) ) {
+        echo $id . "\t__original\t" . $m["original_image"] . "\n";
+      }
+      if ( empty( $m["sizes"] ) || ! is_array( $m["sizes"] ) ) { continue; }
+      foreach ( $m["sizes"] as $name => $s ) {
+        if ( empty( $s["file"] ) ) { continue; }
+        echo $id . "\t" . $name . "\t" . $s["file"] . "\n";
+      }
+    }
+  ' > "$WORK/sizemap.tsv" || warn "  cannot read the attachment metadata"
+}
+
+# Size NAMES, never dimensions. The filename carries the dimensions actually
+# produced after the aspect ratio is preserved, so an uncropped 1024x1024
+# "large" applied to a 1600x900 upload yields -1024x576, which appears in no
+# list of registered sizes. Comparing dimensions would report almost every
+# uncropped thumbnail as stale.
+collect_registered_sizes() {
+  wp_run media image-size --format=csv 2>/dev/null \
+    | tail -n +2 | cut -d, -f1 | sed 's/^"//; s/"$//' | grep -v '^$' \
+    > "$WORK/registered.txt"
+  [[ -s "$WORK/registered.txt" ]] || warn "  no registered image size read, thumbnails will be left alone"
+}
+
+collect_id_set() {
+  local out="$WORK/ids.txt"
+  {
+    # Shapes a query can pin down exactly: an ACF image field or a
+    # _thumbnail_id is the bare integer, a WooCommerce gallery a comma list.
+    wp_run db query "
+      SELECT meta_value FROM ${PREFIX}postmeta
+      WHERE meta_value REGEXP '^[0-9]+$' OR meta_value REGEXP '^[0-9]+(,[0-9]+)+$'
+    " --skip-column-names | expand_id_list
+
+    wp_run db query "
+      SELECT option_value FROM ${PREFIX}options
+      WHERE option_name IN ('custom_logo','site_icon','site_logo')
+    " --skip-column-names | expand_id_list
+
+    # Everything else has to be recognised by its surrounding syntax.
+    extract_id_tokens < "$WORK/haystack.txt"
+  } | sort -u > "$out"
+}
+
+# The pattern file grep matches the haystack against: one basename per line,
+# plus its percent-encoded form when they differ.
+collect_names() {
+  local out="$WORK/names.txt" rel base enc
+  : > "$out"
+  while IFS=$'\t' read -r _ _ _ rel; do
+    [[ -n "$rel" ]] || continue
+    base=$(basename "$rel")
+    printf '%s\n' "$base" >> "$out"
+    enc=$(urlencode_name "$base")
+    [[ "$enc" == "$base" ]] || printf '%s\n' "$enc" >> "$out"
+  done < "$WORK/inventory.tsv"
+
+  while IFS=$'\t' read -r _ _ fname; do
+    [[ -n "$fname" ]] || continue
+    printf '%s\n' "$fname" >> "$out"
+    enc=$(urlencode_name "$fname")
+    [[ "$enc" == "$fname" ]] || printf '%s\n' "$enc" >> "$out"
+  done < "$WORK/sizemap.tsv"
+
+  sort -u -o "$out" "$out"
+}
+
 usage() {
   # Extract header comments from shebang to first non-comment line.
   # Using awk is safer than a fixed line range, which breaks if the header
