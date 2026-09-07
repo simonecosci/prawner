@@ -28,6 +28,12 @@ WP_CLI_CACHE_ROOT="${WP_CLI_CACHE_ROOT:-/var/cache/wp-cli}"
 KEEP_QUARANTINE="${KEEP_QUARANTINE:-3}"
 MIN_AGE_DAYS="${MIN_AGE_DAYS:-30}"
 
+# Directory names, wherever they occur under uploads/, that belong to a
+# plugin's own infrastructure rather than to media the site actually serves.
+# Matched by basename at any depth, so "uploads/2024/01/elementor" and
+# "uploads/elementor" are both excluded.
+EXCLUDE_UPLOAD_DIRS="${EXCLUDE_UPLOAD_DIRS:-woocommerce_uploads wpforms backups wp-personal-data-exports elementor cache}"
+
 ACTION="clean"          # clean | list-quarantine | restore
 ONLY_SITE=""
 ONLY_CLASS="all"        # all | attachments | orphans | thumbs
@@ -281,17 +287,30 @@ collect_inventory() {
 # _wp_attachment_metadata is serialized PHP, which bash parses badly, so this
 # is the one place the script runs PHP. It emits the authoritative map of the
 # files that legitimately belong to each attachment.
+#
+# _wp_attachment_backup_sizes is read too: after a crop or rotate, the edited
+# image becomes the attached file and the pre-edit original plus its old
+# generated sizes survive only in this meta key, under WordPress's own
+# "Restore original image" feature. Emitted under the __backup pseudo size so
+# classify() never treats them as stale.
 collect_size_map() {
   wp_run eval '
     global $wpdb;
     $ids = $wpdb->get_col( "SELECT ID FROM {$wpdb->posts} WHERE post_type = \"attachment\"" );
     foreach ( $ids as $id ) {
       $m = wp_get_attachment_metadata( $id );
-      if ( ! is_array( $m ) ) { continue; }
-      if ( ! empty( $m["original_image"] ) ) {
+      if ( is_array( $m ) && ! empty( $m["original_image"] ) ) {
         echo $id . "\t__original\t" . $m["original_image"] . "\n";
       }
-      if ( empty( $m["sizes"] ) || ! is_array( $m["sizes"] ) ) { continue; }
+      $backup = get_post_meta( $id, "_wp_attachment_backup_sizes", true );
+      if ( is_array( $backup ) ) {
+        foreach ( $backup as $b ) {
+          if ( ! empty( $b["file"] ) ) {
+            echo $id . "\t__backup\t" . $b["file"] . "\n";
+          }
+        }
+      }
+      if ( ! is_array( $m ) || empty( $m["sizes"] ) || ! is_array( $m["sizes"] ) ) { continue; }
       foreach ( $m["sizes"] as $name => $s ) {
         if ( empty( $s["file"] ) ) { continue; }
         echo $id . "\t" . $name . "\t" . $s["file"] . "\n";
@@ -375,7 +394,7 @@ Options:
 
 Environment overrides:
   WWW_ROOT QUARANTINE_ROOT LOG_DIR KEEP_QUARANTINE MIN_AGE_DAYS
-  WP_CLI_CACHE_ROOT
+  WP_CLI_CACHE_ROOT EXCLUDE_UPLOAD_DIRS
 EOF
 }
 
@@ -420,22 +439,47 @@ classify() {
   : > "$WORK/doomed-attachments.tsv"
   : > "$WORK/doomed-orphans.txt"
   : > "$WORK/doomed-thumbs.txt"
+  : > "$WORK/doomed-attachment-files.txt"
 
   local cutoff
   cutoff=$(date -d "-${MIN_AGE_DAYS} days" '+%Y-%m-%d %H:%M:%S')
 
   # --- attachments
+  # A bare integer such as _thumbnail_id or an ACF image field never appears
+  # in the haystack by name: ids.txt is its only defence. An empty ids.txt
+  # means the query that built it failed, not that nothing is referenced, so
+  # trusting it here would doom every old featured image on the site.
   if [[ "$ONLY_CLASS" == "all" || "$ONLY_CLASS" == "attachments" ]]; then
-    local id pdate parent rel base
-    while IFS=$'\t' read -r id pdate parent rel; do
-      [[ -n "$id" ]] || continue
-      [[ "$pdate" < "$cutoff" ]] || continue
-      [[ $KEEP_ATTACHED -eq 0 || "$parent" == "0" ]] || continue
-      base=$(basename "$rel")
-      name_is_used "$base" && continue
-      grep -qxF "$id" "$WORK/ids.txt" && continue
-      printf '%s\t%s\n' "$id" "$rel" >> "$WORK/doomed-attachments.tsv"
-    done < "$WORK/inventory.tsv"
+    if [[ ! -s "$WORK/ids.txt" ]]; then
+      warn "  ids.txt is empty, skipping the attachments class this run"
+    else
+      local id pdate parent rel base
+      while IFS=$'\t' read -r id pdate parent rel; do
+        [[ -n "$id" ]] || continue
+        [[ "$pdate" < "$cutoff" ]] || continue
+        [[ $KEEP_ATTACHED -eq 0 || "$parent" == "0" ]] || continue
+        base=$(basename "$rel")
+        name_is_used "$base" && continue
+        grep -qxF "$id" "$WORK/ids.txt" && continue
+        printf '%s\t%s\n' "$id" "$rel" >> "$WORK/doomed-attachments.tsv"
+      done < "$WORK/inventory.tsv"
+    fi
+  fi
+
+  # Every file report() will already charge to a doomed attachment (its own
+  # attached file, plus every size sizemap.tsv lists for that ID), as paths
+  # relative to $UPLOADS_DIR. The file loop below skips these: without it, a
+  # deregistered thumbnail of a doomed attachment would double-count its
+  # bytes and hand Task 7 the same path in two doomed lists.
+  if [[ -s "$WORK/doomed-attachments.tsv" ]]; then
+    local id rel dir
+    while IFS=$'\t' read -r id rel; do
+      printf '%s\n' "$rel" >> "$WORK/doomed-attachment-files.txt"
+      dir=$(dirname "$rel")
+      awk -F'\t' -v i="$id" '$1 == i { print $3 }' "$WORK/sizemap.tsv" \
+        | sed "s|^|$dir/|" >> "$WORK/doomed-attachment-files.txt"
+    done < "$WORK/doomed-attachments.tsv"
+    sort -u -o "$WORK/doomed-attachment-files.txt" "$WORK/doomed-attachment-files.txt"
   fi
 
   # --- files on disk
@@ -446,30 +490,68 @@ classify() {
   cut -f3 "$WORK/sizemap.tsv"   | sort -u >> "$WORK/known-files.txt"
   sort -u -o "$WORK/known-files.txt" "$WORK/known-files.txt"
 
-  # Size names still registered, plus the pseudo name for the untouched
-  # original of a -scaled upload, which is never a stale thumbnail.
-  cp "$WORK/registered.txt" "$WORK/live-sizes.txt"
-  printf '__original\n' >> "$WORK/live-sizes.txt"
+  # Size names still registered, plus the pseudo names for the untouched
+  # original of a -scaled upload and for a pre-edit backup size, neither of
+  # which is ever a stale thumbnail. A registered.txt that came back empty
+  # means the size-listing query failed, not that no size is registered, so
+  # the whole thumbs class is skipped rather than trusting an empty list.
+  local thumbs_ok=1
+  if [[ -s "$WORK/registered.txt" ]]; then
+    cp "$WORK/registered.txt" "$WORK/live-sizes.txt"
+  else
+    thumbs_ok=0
+    : > "$WORK/live-sizes.txt"
+    warn "  registered.txt is empty, skipping the thumbs class this run"
+  fi
+  printf '__original\n__backup\n' >> "$WORK/live-sizes.txt"
 
-  # filename -> size name, for the thumbnails the metadata knows about.
+  # filename -> size name, for the thumbnails the metadata knows about. A
+  # single file can be shared by two registered sizes with identical
+  # dimensions, so this can hold several rows for the same filename.
   awk -F'\t' '{ print $3 "\t" $2 }' "$WORK/sizemap.tsv" | sort -u > "$WORK/file-to-size.tsv"
 
-  local f fname canon sizename tbase text
+  local f relf fname canon sizenames tbase text
+  local -a prune_names
+  read -ra prune_names <<< "$EXCLUDE_UPLOAD_DIRS"
+  local -a find_cmd=(find "$UPLOADS_DIR")
+  if [[ ${#prune_names[@]} -gt 0 ]]; then
+    local -a name_or=() n
+    for n in "${prune_names[@]}"; do
+      [[ ${#name_or[@]} -eq 0 ]] || name_or+=(-o)
+      name_or+=(-name "$n")
+    done
+    find_cmd+=(-type d \( "${name_or[@]}" \) -prune -o)
+  fi
+  find_cmd+=(-type f -print)
+
   while IFS= read -r f; do
     fname=$(basename "$f")
+
+    # WordPress's own infrastructure files, never media: the index.php every
+    # uploads/ directory ships with, and dotfiles such as the .htaccess that
+    # keeps WooCommerce downloadable products from being served directly.
+    case "$fname" in
+      index.php|index.html|index.htm|web.config|.*) continue ;;
+    esac
 
     # Referenced by name anywhere? Then it stays, whatever it is. This is what
     # protects srcset candidates for sizes that are no longer registered.
     name_is_used "$fname" && continue
 
+    relf="${f#"$UPLOADS_DIR"/}"
+    grep -qxF "$relf" "$WORK/doomed-attachment-files.txt" && continue
+
     if grep -qxF "$fname" "$WORK/known-files.txt"; then
       # Known to WordPress. Only a thumbnail stored under a size name that is
-      # no longer registered can go.
+      # no longer registered can go -- and only when every size name mapped
+      # to this filename is dead, since two live sizes with identical
+      # dimensions collapse onto the same file.
+      [[ $thumbs_ok -eq 1 ]] || continue
       [[ "$ONLY_CLASS" == "all" || "$ONLY_CLASS" == "thumbs" ]] || continue
       parse_thumb_size "$fname" >/dev/null || continue
-      sizename=$(awk -F'\t' -v n="$fname" '$1 == n { print $2; exit }' "$WORK/file-to-size.tsv")
-      [[ -n "$sizename" ]] || continue
-      grep -qxF "$sizename" "$WORK/live-sizes.txt" && continue
+      sizenames=$(awk -F'\t' -v n="$fname" '$1 == n { print $2 }' "$WORK/file-to-size.tsv" | sort -u)
+      [[ -n "$sizenames" ]] || continue
+      printf '%s\n' "$sizenames" | grep -qxFf - "$WORK/live-sizes.txt" && continue
       printf '%s\n' "$f" >> "$WORK/doomed-thumbs.txt"
       continue
     fi
@@ -485,6 +567,7 @@ classify() {
     # a leftover from an earlier regeneration.
     if IFS='|' read -r tbase _ text < <(parse_thumb_size "$fname"); then
       if grep -qxF "$tbase.$text" "$WORK/known-files.txt"; then
+        [[ $thumbs_ok -eq 1 ]] || continue
         [[ "$ONLY_CLASS" == "all" || "$ONLY_CLASS" == "thumbs" ]] || continue
         printf '%s\n' "$f" >> "$WORK/doomed-thumbs.txt"
         continue
@@ -493,7 +576,7 @@ classify() {
 
     [[ "$ONLY_CLASS" == "all" || "$ONLY_CLASS" == "orphans" ]] || continue
     printf '%s\n' "$f" >> "$WORK/doomed-orphans.txt"
-  done < <(find "$UPLOADS_DIR" -type f 2>/dev/null)
+  done < <("${find_cmd[@]}" 2>/dev/null)
 }
 
 # ---------------------------------------------------------------- report
