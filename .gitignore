@@ -1,0 +1,10 @@
+# editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# eventuali dump o backup locali di test
+*.sql
+*.sql.gz
+*.tar.gz
