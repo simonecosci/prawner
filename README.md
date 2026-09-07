@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.jpg" alt="prawner" width="600">
+</p>
+
 # prawner
 
 `prawner` e' un piccolo tool a riga di comando (`wp-site.sh`) per gestire piu'
