@@ -4,13 +4,17 @@
 
 # prawner
 
-`prawner` e' un piccolo tool a riga di comando (`wp-site.sh`) per gestire piu'
-siti WordPress su un singolo VPS Linux con stack **nginx + PHP-FPM + MySQL +
-WP-CLI + certbot**. Automatizza il provisioning, l'emissione dei certificati
-TLS e la rimozione sicura (con backup) dei siti, seguendo sempre le stesse
-convenzioni cosi' da avere un parco siti coerente e facile da ispezionare.
+`prawner` e' un piccolo set di tool a riga di comando per gestire piu' siti
+WordPress su un singolo VPS Linux con stack **nginx + PHP-FPM + MySQL +
+WP-CLI + certbot**:
 
-## Cosa fa
+- **`wp-site.sh`** — provisioning, certificati TLS e rimozione sicura (con
+  backup) dei siti, seguendo sempre le stesse convenzioni cosi' da avere un
+  parco siti coerente e facile da ispezionare.
+- **`wp-update.sh`** — aggiornamento giornaliero automatico di core, plugin e
+  temi su tutti i siti, con backup e rollback automatico se qualcosa si rompe.
+
+## wp-site.sh — provisioning dei siti
 
 - **`list`** — tabella riassuntiva di tutti i siti configurati in nginx:
   dominio, docroot, owner, se il vhost e' abilitato, giorni alla scadenza del
@@ -60,25 +64,33 @@ si bloccano) se non corrisponde.
 ## Installazione
 
 ```bash
-git clone https://github.com/<tuo-utente>/prawner.git
+git clone https://github.com/simonecosci/prawner.git
 cd prawner
 sudo ./install.sh
 ```
 
-Questo copia `bin/wp-site.sh` in `/usr/local/bin/wp-site.sh` e segnala eventuali
-dipendenze mancanti. Per disinstallare:
+Questo copia `bin/wp-site.sh` e `bin/wp-update.sh` in `/usr/local/bin/` e
+segnala eventuali dipendenze mancanti. Per installare anche il cron
+giornaliero di `wp-update.sh` in un colpo solo:
 
 ```bash
-sudo ./uninstall.sh
+sudo ./install.sh --with-cron
 ```
 
-Per usarlo senza installarlo, e' sufficiente lanciarlo dal repo:
+Per disinstallare (aggiungi `--with-cron` per rimuovere anche il cron):
+
+```bash
+sudo ./uninstall.sh [--with-cron]
+```
+
+Per usare i comandi senza installarli, e' sufficiente lanciarli dal repo:
 
 ```bash
 sudo ./bin/wp-site.sh list
+sudo ./bin/wp-update.sh --dry-run
 ```
 
-## Uso
+## Uso — wp-site.sh
 
 ```bash
 wp-site.sh list
@@ -114,6 +126,76 @@ Tutte le convenzioni sono sovrascrivibili per adattarsi a setup diversi:
 | `WP_CLI_CACHE_ROOT`  | `/var/cache/wp-cli`                      |
 | `DEFAULT_OWNER`      | `www-data`                               |
 | `ADMIN_EMAIL`        | *(vuoto)* — email admin di default per `create`/`cert` |
+
+## wp-update.sh — aggiornamenti automatici
+
+`wp-update.sh` scandisce `$WWW_ROOT` alla ricerca di ogni installazione
+WordPress reale (ogni `wp-config.php` trovato, non solo `<dominio>/wordpress`)
+e per ciascuna:
+
+1. fa un backup (dump del DB + tar di `wp-content/{plugins,themes,mu-plugins}`,
+   esclusi gli `uploads`) in `$BACKUP_ROOT/<sito>/<timestamp>/`;
+2. aggiorna core → plugin → temi → schema del DB;
+3. esegue uno smoke test HTTP (home page + `wp-login.php`, controllo di
+   errori PHP/DB nella risposta);
+4. se lo smoke test fallisce, esegue il **rollback automatico** dal backup
+   appena fatto (core, `wp-content`, database) e ritenta lo smoke test.
+
+I siti "canarino" (path contenente `test`, es. `wordpress-test`) vengono
+aggiornati per primi, cosi' un problema emerge li' prima di toccare i siti
+di produzione.
+
+```bash
+wp-update.sh                   # aggiorna tutto
+wp-update.sh --dry-run         # mostra solo cosa verrebbe aggiornato
+wp-update.sh --site example.com   # un solo sito (match parziale sul path)
+wp-update.sh --no-core         # solo plugin e temi
+wp-update.sh --skip-smoke      # salta smoke test e rollback
+```
+
+L'exit code e' diverso da zero se almeno un sito ha avuto problemi — utile
+per il monitoring del cron.
+
+### Variabili d'ambiente
+
+| Variabile           | Default            |
+|---------------------|---------------------|
+| `WWW_ROOT`           | `/var/www`          |
+| `BACKUP_ROOT`        | `/var/backups/wp`   |
+| `LOG_DIR`            | `/var/log/wp-update` |
+| `KEEP_BACKUPS`       | `3` (set di backup mantenuti per sito) |
+| `MIN_FREE_MB`        | `1024` (spazio minimo richiesto su `BACKUP_ROOT`) |
+| `CURL_TIMEOUT`       | `30` (secondi, per lo smoke test) |
+| `WP_CLI_CACHE_ROOT`  | `/var/cache/wp-cli`  |
+
+### Cron giornaliero
+
+Il modo piu' semplice e' installarlo insieme ai comandi:
+
+```bash
+sudo ./install.sh --with-cron
+```
+
+In alternativa, a mano:
+
+```bash
+sudo cp cron.d/wp-update /etc/cron.d/wp-update
+sudo chmod 644 /etc/cron.d/wp-update
+sudo chown root:root /etc/cron.d/wp-update
+```
+
+Il file [`cron.d/wp-update`](cron.d/wp-update) lancia `wp-update.sh` ogni
+giorno alle 03:30 come root, con `flock` per evitare run sovrapposti se
+un aggiornamento precedente e' ancora in corso:
+
+```cron
+30 3 * * * root flock -n /run/wp-update.lock /usr/local/bin/wp-update.sh >> /var/log/wp-update/cron.log 2>&1
+```
+
+Log:
+
+- `/var/log/wp-update/cron.log` — output dell'ultima esecuzione via cron
+- `/var/log/wp-update/<timestamp>.log` — log dettagliato di ogni singolo run
 
 ## Sicurezza
 

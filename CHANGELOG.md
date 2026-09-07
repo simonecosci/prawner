@@ -3,6 +3,17 @@
 Tutte le modifiche rilevanti a questo progetto sono documentate qui.
 Il formato segue [Keep a Changelog](https://keepachangelog.com/it/1.1.0/).
 
+## [Non rilasciato]
+
+### Aggiunto
+- `wp-update.sh`: aggiornamento automatico di core, plugin e temi per tutti i
+  siti trovati in `$WWW_ROOT`, con backup pre-update, smoke test HTTP e
+  rollback automatico in caso di fallimento.
+- `cron.d/wp-update`: template per l'esecuzione giornaliera automatica via
+  `/etc/cron.d/wp-update` (con `flock` anti-sovrapposizione).
+- `install.sh --with-cron` / `uninstall.sh --with-cron`: installano/rimuovono
+  anche il cron di `wp-update.sh` insieme ai comandi.
+
 ## [1.0.0] - 2026-09-07
 
 ### Aggiunto

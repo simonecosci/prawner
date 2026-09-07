@@ -1,0 +1,20 @@
+# /etc/cron.d/wp-update - aggiornamento giornaliero dei siti WordPress (prawner)
+#
+# Installazione:
+#   sudo cp cron.d/wp-update /etc/cron.d/wp-update
+#   sudo chmod 644 /etc/cron.d/wp-update
+#   sudo chown root:root /etc/cron.d/wp-update
+#
+# (oppure: sudo ./install.sh --with-cron)
+#
+# Log:
+#   ultimo output  -> /var/log/wp-update/cron.log
+#   log per run    -> /var/log/wp-update/<timestamp>.log
+#
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=""
+
+# ogni giorno alle 03:30; flock evita run sovrapposti se un aggiornamento
+# precedente e' ancora in corso (backup/rollback non vanno eseguiti in parallelo)
+30 3 * * * root flock -n /run/wp-update.lock /usr/local/bin/wp-update.sh >> /var/log/wp-update/cron.log 2>&1
