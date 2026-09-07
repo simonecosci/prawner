@@ -138,6 +138,92 @@ name_is_used() {
   [[ "$enc" != "$n" ]] && grep -qxF "$enc" "$WORK/used-names.txt"
 }
 
+# ------------------------------------------------------------- wp plumbing
+
+require_cmds() {
+  local missing=() c
+  for c in wp mysql grep sed awk comm sort find stat sudo; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  [[ ${#missing[@]} -eq 0 ]] || die "missing commands: ${missing[*]}"
+}
+
+# Runs wp-cli as the user owning the installation, so anything it writes keeps
+# the right ownership. Each owner gets its own cache: www-data and the ftp
+# users have a non-writable HOME, and a shared cache directory ends up owned by
+# whoever ran first.
+wp_run() {
+  if [[ "$SITE_OWNER" == "root" ]]; then
+    env WP_CLI_CACHE_DIR="$SITE_CACHE_DIR" wp --path="$SITE_PATH" --allow-root "$@" 2>>"$LOG_FILE"
+  else
+    sudo -u "$SITE_OWNER" env WP_CLI_CACHE_DIR="$SITE_CACHE_DIR" HOME=/tmp \
+      wp --path="$SITE_PATH" "$@" 2>>"$LOG_FILE"
+  fi
+}
+
+# Finds every real installation rather than assuming <domain>/wordpress, the
+# same way wp-update.sh does: this also picks up wordpress-test directories and
+# installations sitting at the domain root.
+discover_sites() {
+  mapfile -t CONFIGS < <(
+    find "$WWW_ROOT" -mindepth 2 -maxdepth 3 -name wp-config.php \
+         -not -path '*/wp-content/*' 2>/dev/null | sort
+  )
+}
+
+load_site() {
+  local cfg="$1"
+  SITE_PATH=$(dirname "$cfg")
+  SITE_NAME=${SITE_PATH#"$WWW_ROOT"/}
+  SITE_SLUG=${SITE_NAME//\//_}
+  SITE_OWNER=$(stat -c %U "$SITE_PATH")
+  SITE_GROUP=$(stat -c %G "$SITE_PATH")
+  SITE_CACHE_DIR="$WP_CLI_CACHE_ROOT/$SITE_OWNER"
+  install -d -o "$SITE_OWNER" -m 0755 "$SITE_CACHE_DIR" 2>/dev/null || {
+    mkdir -p "$SITE_CACHE_DIR"; chown -R "$SITE_OWNER" "$SITE_CACHE_DIR"
+  }
+
+  wp_run core is-installed >/dev/null 2>&1 || {
+    warn "  wp-cli cannot load the installation (DB down? wp-config?), skipping"
+    return 1
+  }
+
+  PREFIX=$(wp_run config get table_prefix | tr -d '\r\n')
+  [[ -n "$PREFIX" ]] || { warn "  cannot read the table prefix, skipping"; return 1; }
+
+  UPLOADS_DIR=$(wp_run eval '$u = wp_get_upload_dir(); echo $u["basedir"];' | tr -d '\r\n')
+  [[ -d "$UPLOADS_DIR" ]] || { warn "  uploads directory not found ($UPLOADS_DIR), skipping"; return 1; }
+
+  return 0
+}
+
+# Calls <fn> once per site with the site globals set. Every site is independent:
+# one failure never stops the others, which is why the script does not use -e.
+for_each_site() {
+  local fn="$1" cfg
+  OK=(); FAILED=()
+
+  discover_sites
+  [[ ${#CONFIGS[@]} -gt 0 ]] && [[ -n "${CONFIGS[0]}" ]] || {
+    warn "no WordPress installation found under $WWW_ROOT"
+    return 0
+  }
+
+  for cfg in "${CONFIGS[@]}"; do
+    SITE_PATH=$(dirname "$cfg")
+    if [[ -n "$ONLY_SITE" && "${SITE_PATH#"$WWW_ROOT"/}" != *"$ONLY_SITE"* ]]; then
+      continue
+    fi
+    log ""
+    log "--- ${SITE_PATH#"$WWW_ROOT"/}"
+    if load_site "$cfg" && "$fn"; then
+      OK+=("$SITE_NAME")
+    else
+      FAILED+=("${SITE_PATH#"$WWW_ROOT"/}")
+    fi
+  done
+}
+
 usage() {
   # Extract header comments from shebang to first non-comment line.
   # Using awk is safer than a fixed line range, which breaks if the header
@@ -189,12 +275,30 @@ parse_args() {
   fi
 }
 
+clean_site() {
+  log "  prefix=$PREFIX uploads=$UPLOADS_DIR owner=$SITE_OWNER:$SITE_GROUP"
+  return 0
+}
+
 main() {
   parse_args "$@"
   [[ $EUID -eq 0 ]] || die "root required (use sudo)"
+  require_cmds
   mkdir -p "$LOG_DIR" "$QUARANTINE_ROOT"
   LOG_FILE="$LOG_DIR/$STAMP.log"
-  die "not implemented yet"
+
+  case "$ACTION" in
+    list-quarantine) die "not implemented yet" ;;
+    restore)         die "not implemented yet" ;;
+    clean)
+      log "=== wp-media-clean start (apply=$APPLY, only=$ONLY_CLASS) ==="
+      for_each_site clean_site
+      log ""
+      log "=== done: ${#OK[@]} ok, ${#FAILED[@]} failed ==="
+      [[ ${#FAILED[@]} -eq 0 ]] || warn "sites with problems: ${FAILED[*]}"
+      [[ ${#FAILED[@]} -eq 0 ]]
+      ;;
+  esac
 }
 
 # Only run when executed, so that tests/run.sh can source this file and call
