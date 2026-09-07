@@ -48,7 +48,10 @@ info() { printf '  %s\n' "$*"; }
 log()  { printf '%s\n' "$*"; [[ -n "$LOG_FILE" ]] && printf '%s  %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE"; return 0; }
 
 usage() {
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  # Extract header comments from shebang to first non-comment line.
+  # Using awk is safer than a fixed line range, which breaks if the header
+  # is edited.
+  awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"
   cat <<'EOF'
 
 Options:
