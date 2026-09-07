@@ -262,7 +262,7 @@ collect_haystack() {
     local d
     for d in themes plugins mu-plugins; do
       [[ -d "$SITE_PATH/wp-content/$d" ]] || continue
-      grep -rIoh -f "$WORK/names.txt" "$SITE_PATH/wp-content/$d" 2>/dev/null >> "$out"
+      grep -rIohF -f "$WORK/names.txt" "$SITE_PATH/wp-content/$d" 2>/dev/null >> "$out"
     done
   fi
 
