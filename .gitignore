@@ -11,3 +11,6 @@ Thumbs.db
 
 # tooling
 .serena/
+
+# worktrees
+.claude/worktrees/
