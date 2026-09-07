@@ -8,3 +8,6 @@ Thumbs.db
 *.sql
 *.sql.gz
 *.tar.gz
+
+# tooling
+.serena/
