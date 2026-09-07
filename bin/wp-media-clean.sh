@@ -95,6 +95,49 @@ urlencode_name() {
   printf '%s\n' "$out"
 }
 
+# ------------------------------------------------------ reference helpers
+
+# extract_id_tokens  (stdin -> stdout)
+# Prints every integer that appears on stdin in a shape that identifies an
+# attachment, one per line. Only patterned occurrences count:
+#   i:123;          integers inside a serialized array (theme mods, builders)
+#   s:3:"123"       numeric strings inside a serialized array
+#   wp-image-123    the class the classic editor writes on <img>
+#   "id":123        Gutenberg block attributes, also in their escaped form
+# Bare integers are deliberately NOT collected here. Any four digit year in any
+# post would otherwise become an attachment ID and nothing would ever be
+# reported. The bare integer sources (ACF fields, _thumbnail_id) arrive through
+# expand_id_list instead, from a query that already restricts the shape.
+extract_id_tokens() {
+  grep -oE 'i:[0-9]+;|s:[0-9]+:"[0-9]+"|wp-image-[0-9]+|"id":[0-9]+|&quot;id&quot;:[0-9]+' \
+    | sed -E 's/^i:([0-9]+);$/\1/
+              s/^s:[0-9]+:"([0-9]+)"$/\1/
+              s/^wp-image-//
+              s/^"id"://
+              s/^&quot;id&quot;://'
+}
+
+# expand_id_list  (stdin -> stdout)
+# Reads meta values that are already known to be an attachment reference and
+# flattens them: "123" stays as is, the "12,45,78" of a WooCommerce gallery
+# becomes three lines. Anything not a plain integer is dropped.
+expand_id_list() {
+  tr ',' '\n' | grep -oE '^[0-9]+$'
+}
+
+# name_is_used <filename>
+# True when the haystack mentions this file. Both spellings are checked: the
+# match written into used-names.txt is whatever the content actually contained,
+# so a reference written as "my%20holiday.jpg" lands there in encoded form
+# while the upload on disk is named "my holiday.jpg". Checking only the plain
+# name would report that file as unused.
+name_is_used() {
+  local n="$1"
+  grep -qxF "$n" "$WORK/used-names.txt" && return 0
+  local enc; enc=$(urlencode_name "$n")
+  [[ "$enc" != "$n" ]] && grep -qxF "$enc" "$WORK/used-names.txt"
+}
+
 usage() {
   # Extract header comments from shebang to first non-comment line.
   # Using awk is safer than a fixed line range, which breaks if the header

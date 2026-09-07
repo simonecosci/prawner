@@ -69,6 +69,41 @@ assert_eq "encode: space"      "my%20photo.jpg"   "$(urlencode_name 'my photo.jp
 assert_eq "encode: safe chars" "foto_1-2.jpg"     "$(urlencode_name 'foto_1-2.jpg')"
 assert_eq "encode: utf8"       "citt%C3%A0.jpg"   "$(urlencode_name 'città.jpg')"
 
+# ---------------------------------------------------------------- tokens
+
+assert_eq "id: wp-image class" "42" \
+  "$(printf '<img class="x wp-image-42" src="/u/p.jpg">' | extract_id_tokens)"
+assert_eq "id: block attribute" "99" \
+  "$(printf '<!-- wp:image {"id":99,"sizeSlug":"large"} -->' | extract_id_tokens)"
+assert_eq "id: escaped block attribute" "77" \
+  "$(printf '&quot;id&quot;:77' | extract_id_tokens)"
+assert_eq "id: serialized array" "0
+45
+1
+78" "$(printf 'a:2:{i:0;i:45;i:1;i:78;}' | extract_id_tokens)"
+assert_eq "id: serialized numeric string" "123" \
+  "$(printf 's:3:"123"' | extract_id_tokens)"
+# A bare number in prose must not become an ID: that is what would make the
+# ID set swallow the whole library and report nothing.
+assert_eq "id: bare number in prose is ignored" "" \
+  "$(printf 'published in 2024 with 15 photos' | extract_id_tokens)"
+
+assert_eq "list: comma separated" "12
+45
+78" "$(printf '12,45,78\n' | expand_id_list)"
+assert_eq "list: single value" "123" "$(printf '123\n' | expand_id_list)"
+assert_eq "list: non numeric ignored" "" "$(printf 'abc\n1.5\n\n' | expand_id_list)"
+
+# name_is_used reads $WORK/used-names.txt, so the test provides one.
+WORK=$(mktemp -d)
+printf 'photo.jpg\nmy%%20holiday.jpg\n' > "$WORK/used-names.txt"
+assert_eq "used: plain hit"    "yes" "$(name_is_used 'photo.jpg' && echo yes)"
+assert_eq "used: miss"         ""    "$(name_is_used 'other.jpg' && echo yes)"
+# The reference in the content is percent-encoded while the upload on disk is
+# not: without checking the encoded form too, this file looks unused.
+assert_eq "used: encoded hit"  "yes" "$(name_is_used 'my holiday.jpg' && echo yes)"
+rm -rf "$WORK"; unset WORK
+
 # ---------------------------------------------------------------- summary
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
