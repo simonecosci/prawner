@@ -200,7 +200,7 @@ load_site() {
 # Calls <fn> once per site with the site globals set. Every site is independent:
 # one failure never stops the others, which is why the script does not use -e.
 for_each_site() {
-  local fn="$1" cfg
+  local fn="$1" cfg matched=0
   OK=(); FAILED=()
 
   discover_sites
@@ -214,6 +214,7 @@ for_each_site() {
     if [[ -n "$ONLY_SITE" && "${SITE_PATH#"$WWW_ROOT"/}" != *"$ONLY_SITE"* ]]; then
       continue
     fi
+    matched=$((matched + 1))
     log ""
     log "--- ${SITE_PATH#"$WWW_ROOT"/}"
     if load_site "$cfg" && "$fn"; then
@@ -222,6 +223,15 @@ for_each_site() {
       FAILED+=("${SITE_PATH#"$WWW_ROOT"/}")
     fi
   done
+
+  # A filter that matches nothing must not look like a successful no-op:
+  # the caller needs to see this as failure, not as "nothing to do".
+  if [[ -n "$ONLY_SITE" && $matched -eq 0 ]]; then
+    warn "--site '$ONLY_SITE' matched none of the ${#CONFIGS[@]} installations found under $WWW_ROOT"
+    return 1
+  fi
+
+  return 0
 }
 
 usage() {
@@ -292,11 +302,12 @@ main() {
     restore)         die "not implemented yet" ;;
     clean)
       log "=== wp-media-clean start (apply=$APPLY, only=$ONLY_CLASS) ==="
-      for_each_site clean_site
+      local site_rc=0
+      for_each_site clean_site || site_rc=$?
       log ""
       log "=== done: ${#OK[@]} ok, ${#FAILED[@]} failed ==="
       [[ ${#FAILED[@]} -eq 0 ]] || warn "sites with problems: ${FAILED[*]}"
-      [[ ${#FAILED[@]} -eq 0 ]]
+      [[ ${#FAILED[@]} -eq 0 && $site_rc -eq 0 ]]
       ;;
   esac
 }
