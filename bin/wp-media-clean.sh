@@ -476,8 +476,14 @@ classify() {
     while IFS=$'\t' read -r id rel; do
       printf '%s\n' "$rel" >> "$WORK/doomed-attachment-files.txt"
       dir=$(dirname "$rel")
-      awk -F'\t' -v i="$id" '$1 == i { print $3 }' "$WORK/sizemap.tsv" \
-        | sed "s|^|$dir/|" >> "$WORK/doomed-attachment-files.txt"
+      # dirname prints "." for a root-level upload (uploads_use_yearmonth_folders
+      # off): drop it so the entry has no "./" prefix and matches $relf below
+      # exactly. The prefix is passed to awk as a variable rather than spliced
+      # into a sed replacement, so a directory name containing "|" or "&" is
+      # applied literally instead of being read as sed syntax.
+      [[ "$dir" == "." ]] && dir=""
+      awk -F'\t' -v i="$id" -v pre="${dir:+$dir/}" '$1 == i { print pre $3 }' "$WORK/sizemap.tsv" \
+        >> "$WORK/doomed-attachment-files.txt"
     done < "$WORK/doomed-attachments.tsv"
     sort -u -o "$WORK/doomed-attachment-files.txt" "$WORK/doomed-attachment-files.txt"
   fi
@@ -606,8 +612,12 @@ report() {
   local id rel dir
   while IFS=$'\t' read -r id rel; do
     dir=$(dirname "$rel")
+    # Same root-level case as classify()'s doomed-attachment-files.txt: drop
+    # the "." dirname gives for an upload with no directory component, so
+    # the two agree on which files exist under a doomed attachment.
+    [[ "$dir" == "." ]] && dir=""
     awk -F'\t' -v i="$id" '$1 == i { print $3 }' "$WORK/sizemap.tsv" \
-      | sed "s|^|$UPLOADS_DIR/$dir/|" >> "$WORK/att-files.txt"
+      | sed "s|^|$UPLOADS_DIR/${dir:+$dir/}|" >> "$WORK/att-files.txt"
   done < "$WORK/doomed-attachments.tsv"
 
   b_att=$(bytes_of   < "$WORK/att-files.txt")
