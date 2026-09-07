@@ -4,64 +4,64 @@
 
 # prawner
 
-`prawner` e' un piccolo set di tool a riga di comando per gestire piu' siti
-WordPress su un singolo VPS Linux con stack **nginx + PHP-FPM + MySQL +
-WP-CLI + certbot**:
+`prawner` is a small set of command line tools to manage several WordPress
+sites on a single Linux VPS with an **nginx + PHP-FPM + MySQL + WP-CLI +
+certbot** stack:
 
-- **`wp-site.sh`** — provisioning, certificati TLS e rimozione sicura (con
-  backup) dei siti, seguendo sempre le stesse convenzioni cosi' da avere un
-  parco siti coerente e facile da ispezionare.
-- **`wp-update.sh`** — aggiornamento giornaliero automatico di core, plugin e
-  temi su tutti i siti, con backup e rollback automatico se qualcosa si rompe.
+- **`wp-site.sh`** — provisioning, TLS certificates and safe removal (with a
+  backup) of sites, always following the same conventions so that you end up
+  with a coherent set of sites that is easy to inspect.
+- **`wp-update.sh`** — automatic daily updates of core, plugins and themes on
+  every site, with a backup and an automatic rollback if something breaks.
 
-## wp-site.sh — provisioning dei siti
+## wp-site.sh — site provisioning
 
-- **`list`** — tabella riassuntiva di tutti i siti configurati in nginx:
-  dominio, docroot, owner, se il vhost e' abilitato, giorni alla scadenza del
-  certificato TLS. Segnala anche i docroot senza un vhost corrispondente.
-- **`create <dominio>`** — crea da zero un sito nuovo:
-  utente di sistema dedicato, database MySQL, download e installazione di
-  WordPress via WP-CLI, permessi di filesystem corretti, vhost nginx con
-  hardening di base, verifica preventiva del DNS.
-- **`cert <dominio>`** — richiede il certificato TLS con certbot (plugin
-  nginx), verifica che il DNS punti al server prima di procedere, e allinea
-  `home`/`siteurl` di WordPress all'URL https.
-- **`remove <dominio>`** — rimuove un sito in modo guidato: esegue prima un
-  backup completo (dump del database, archivio dei file, vhost, credenziali)
-  in `/var/backups/wp-site`, poi chiede conferma esplicita scrivendo il nome
-  del dominio, e solo a quel punto smonta vhost, database, certificato e file.
+- **`list`** — summary table of every site configured in nginx: domain,
+  docroot, owner, whether the vhost is enabled, days left before the TLS
+  certificate expires. It also reports docroots without a matching vhost.
+- **`create <domain>`** — creates a new site from scratch:
+  dedicated system user, MySQL database, WordPress download and install via
+  WP-CLI, correct filesystem permissions, nginx vhost with basic hardening,
+  upfront DNS check.
+- **`cert <domain>`** — requests the TLS certificate with certbot (nginx
+  plugin), verifies that DNS points to the server before proceeding, and
+  aligns WordPress `home`/`siteurl` with the https URL.
+- **`remove <domain>`** — removes a site in a guided way: it first takes a
+  full backup (database dump, file archive, vhost, credentials) in
+  `/var/backups/wp-site`, then asks for explicit confirmation by typing the
+  domain name, and only then tears down vhost, database, certificate and files.
 
-## Convenzioni
+## Conventions
 
-| Cosa      | Percorso / valore                                      |
-|-----------|---------------------------------------------------------|
-| Docroot   | `/var/www/<dominio>/wordpress/`                          |
-| Vhost     | `/etc/nginx/sites-available/<slug>` (senza estensione)   |
-| Enable    | symlink in `/etc/nginx/sites-enabled/`                   |
-| PHP-FPM   | `unix:/run/php/php8.1-fpm.sock` (pool `www-data`)        |
-| TLS       | `certbot --nginx`, riscrive il vhost aggiungendo `:443`  |
-| Credenziali | salvate in `/root/wp-sites/<dominio>.txt` (permessi 600) |
-| Backup    | `/var/backups/wp-site/<dominio>-<timestamp>/`            |
+| What        | Path / value                                             |
+|-------------|----------------------------------------------------------|
+| Docroot     | `/var/www/<domain>/wordpress/`                            |
+| Vhost       | `/etc/nginx/sites-available/<slug>` (no extension)        |
+| Enable      | symlink in `/etc/nginx/sites-enabled/`                    |
+| PHP-FPM     | `unix:/run/php/php8.1-fpm.sock` (pool `www-data`)         |
+| TLS         | `certbot --nginx`, rewrites the vhost adding `:443`       |
+| Credentials | saved in `/root/wp-sites/<domain>.txt` (mode 600)         |
+| Backup      | `/var/backups/wp-site/<domain>-<timestamp>/`              |
 
-## Requisiti
+## Requirements
 
-Il tool presuppone un VPS gia' configurato con:
+The tool assumes a VPS that is already set up with:
 
-- Linux con `bash`, eseguito **come root** (o via `sudo`)
+- Linux with `bash`, run **as root** (or via `sudo`)
 - `nginx`
-- PHP-FPM in ascolto su un socket unix (default `php8.1-fpm`)
-- MySQL/MariaDB raggiungibile con il client `mysql` (credenziali di root gia'
-  disponibili, es. via `~/.my.cnf` o socket auth)
-- [`wp-cli`](https://wp-cli.org/) installato e nel `PATH`
-- [`certbot`](https://certbot.eff.org/) con il plugin nginx
+- PHP-FPM listening on a unix socket (default `php8.1-fpm`)
+- MySQL/MariaDB reachable with the `mysql` client (root credentials already
+  available, e.g. via `~/.my.cnf` or socket auth)
+- [`wp-cli`](https://wp-cli.org/) installed and in the `PATH`
+- [`certbot`](https://certbot.eff.org/) with the nginx plugin
   (`apt install certbot python3-certbot-nginx`)
-- `openssl`, `curl`, `getent`, gli strumenti di base coreutils
+- `openssl`, `curl`, `getent`, the basic coreutils tools
 
-Il DNS del dominio deve gia' puntare all'IP pubblico del VPS prima di lanciare
-`create` o `cert`: entrambi i comandi verificano la risoluzione e avvisano (o
-si bloccano) se non corrisponde.
+The domain DNS must already point to the public IP of the VPS before running
+`create` or `cert`: both commands check the resolution and warn (or stop) if
+it does not match.
 
-## Installazione
+## Installation
 
 ```bash
 git clone https://github.com/simonecosci/prawner.git
@@ -69,28 +69,28 @@ cd prawner
 sudo ./install.sh
 ```
 
-Questo copia `bin/wp-site.sh` e `bin/wp-update.sh` in `/usr/local/bin/` e
-segnala eventuali dipendenze mancanti. Per installare anche il cron
-giornaliero di `wp-update.sh` in un colpo solo:
+This copies `bin/wp-site.sh` and `bin/wp-update.sh` into `/usr/local/bin/` and
+reports any missing dependencies. To install the daily `wp-update.sh` cron job
+at the same time:
 
 ```bash
 sudo ./install.sh --with-cron
 ```
 
-Per disinstallare (aggiungi `--with-cron` per rimuovere anche il cron):
+To uninstall (add `--with-cron` to remove the cron job as well):
 
 ```bash
 sudo ./uninstall.sh [--with-cron]
 ```
 
-Per usare i comandi senza installarli, e' sufficiente lanciarli dal repo:
+To use the commands without installing them, just run them from the repo:
 
 ```bash
 sudo ./bin/wp-site.sh list
 sudo ./bin/wp-update.sh --dry-run
 ```
 
-## Uso — wp-site.sh
+## Usage — wp-site.sh
 
 ```bash
 wp-site.sh list
@@ -104,19 +104,19 @@ wp-site.sh cert example.com --no-www
 wp-site.sh remove example.com
 ```
 
-### Opzioni di `create`
+### `create` options
 
-| Opzione           | Descrizione                                              |
-|-------------------|-----------------------------------------------------------|
-| `--owner <utente>`| Utente di sistema proprietario dei file (default `www-data`, creato se non esiste) |
-| `--no-www`        | Non include `www.<dominio>` nel vhost / nel certificato    |
-| `--admin-email <mail>` | Email amministratore WordPress (obbligatoria, oppure via `ADMIN_EMAIL`) |
+| Option                 | Description                                              |
+|------------------------|----------------------------------------------------------|
+| `--owner <user>`       | System user owning the files (default `www-data`, created if missing) |
+| `--no-www`             | Does not include `www.<domain>` in the vhost / certificate |
+| `--admin-email <mail>` | WordPress administrator email (required, or via `ADMIN_EMAIL`) |
 
-### Variabili d'ambiente
+### Environment variables
 
-Tutte le convenzioni sono sovrascrivibili per adattarsi a setup diversi:
+Every convention can be overridden to fit different setups:
 
-| Variabile           | Default                                  |
+| Variable            | Default                                   |
 |---------------------|-------------------------------------------|
 | `NGINX_AVAIL`        | `/etc/nginx/sites-available`             |
 | `NGINX_ENABLED`      | `/etc/nginx/sites-enabled`               |
@@ -125,58 +125,57 @@ Tutte le convenzioni sono sovrascrivibili per adattarsi a setup diversi:
 | `BACKUP_ROOT`        | `/var/backups/wp-site`                   |
 | `WP_CLI_CACHE_ROOT`  | `/var/cache/wp-cli`                      |
 | `DEFAULT_OWNER`      | `www-data`                               |
-| `ADMIN_EMAIL`        | *(vuoto)* — email admin di default per `create`/`cert` |
+| `WP_LOCALE`          | `it_IT` — locale of the WordPress installed by `create` |
+| `ADMIN_EMAIL`        | *(empty)* — default admin email for `create`/`cert` |
 
-## wp-update.sh — aggiornamenti automatici
+## wp-update.sh — automatic updates
 
-`wp-update.sh` scandisce `$WWW_ROOT` alla ricerca di ogni installazione
-WordPress reale (ogni `wp-config.php` trovato, non solo `<dominio>/wordpress`)
-e per ciascuna:
+`wp-update.sh` scans `$WWW_ROOT` looking for every real WordPress installation
+(every `wp-config.php` found, not just `<domain>/wordpress`) and for each one:
 
-1. fa un backup (dump del DB + tar di `wp-content/{plugins,themes,mu-plugins}`,
-   esclusi gli `uploads`) in `$BACKUP_ROOT/<sito>/<timestamp>/`;
-2. aggiorna core → plugin → temi → schema del DB;
-3. esegue uno smoke test HTTP (home page + `wp-login.php`, controllo di
-   errori PHP/DB nella risposta);
-4. se lo smoke test fallisce, esegue il **rollback automatico** dal backup
-   appena fatto (core, `wp-content`, database) e ritenta lo smoke test.
+1. takes a backup (DB dump + tar of `wp-content/{plugins,themes,mu-plugins}`,
+   `uploads` excluded) in `$BACKUP_ROOT/<site>/<timestamp>/`;
+2. updates core → plugins → themes → DB schema;
+3. runs an HTTP smoke test (home page + `wp-login.php`, checking the response
+   for PHP/DB errors);
+4. if the smoke test fails, performs an **automatic rollback** from the backup
+   just taken (core, `wp-content`, database) and retries the smoke test.
 
-I siti "canarino" (path contenente `test`, es. `wordpress-test`) vengono
-aggiornati per primi, cosi' un problema emerge li' prima di toccare i siti
-di produzione.
+The "canary" sites (paths containing `test`, e.g. `wordpress-test`) are updated
+first, so that a problem shows up there before production sites are touched.
 
 ```bash
-wp-update.sh                   # aggiorna tutto
-wp-update.sh --dry-run         # mostra solo cosa verrebbe aggiornato
-wp-update.sh --site example.com   # un solo sito (match parziale sul path)
-wp-update.sh --no-core         # solo plugin e temi
-wp-update.sh --skip-smoke      # salta smoke test e rollback
+wp-update.sh                   # update everything
+wp-update.sh --dry-run         # only show what would be updated
+wp-update.sh --site example.com   # a single site (partial match on the path)
+wp-update.sh --no-core         # plugins and themes only
+wp-update.sh --skip-smoke      # skip the smoke test and the rollback
 ```
 
-L'exit code e' diverso da zero se almeno un sito ha avuto problemi — utile
-per il monitoring del cron.
+The exit code is non-zero if at least one site had problems — handy for cron
+monitoring.
 
-### Variabili d'ambiente
+### Environment variables
 
-| Variabile           | Default            |
+| Variable            | Default             |
 |---------------------|---------------------|
 | `WWW_ROOT`           | `/var/www`          |
 | `BACKUP_ROOT`        | `/var/backups/wp`   |
 | `LOG_DIR`            | `/var/log/wp-update` |
-| `KEEP_BACKUPS`       | `3` (set di backup mantenuti per sito) |
-| `MIN_FREE_MB`        | `1024` (spazio minimo richiesto su `BACKUP_ROOT`) |
-| `CURL_TIMEOUT`       | `30` (secondi, per lo smoke test) |
+| `KEEP_BACKUPS`       | `3` (backup sets kept per site) |
+| `MIN_FREE_MB`        | `1024` (minimum space required on `BACKUP_ROOT`) |
+| `CURL_TIMEOUT`       | `30` (seconds, for the smoke test) |
 | `WP_CLI_CACHE_ROOT`  | `/var/cache/wp-cli`  |
 
-### Cron giornaliero
+### Daily cron
 
-Il modo piu' semplice e' installarlo insieme ai comandi:
+The easiest way is to install it together with the commands:
 
 ```bash
 sudo ./install.sh --with-cron
 ```
 
-In alternativa, a mano:
+Alternatively, by hand:
 
 ```bash
 sudo cp cron.d/wp-update /etc/cron.d/wp-update
@@ -184,34 +183,34 @@ sudo chmod 644 /etc/cron.d/wp-update
 sudo chown root:root /etc/cron.d/wp-update
 ```
 
-Il file [`cron.d/wp-update`](cron.d/wp-update) lancia `wp-update.sh` ogni
-giorno alle 03:30 come root, con `flock` per evitare run sovrapposti se
-un aggiornamento precedente e' ancora in corso:
+The [`cron.d/wp-update`](cron.d/wp-update) file runs `wp-update.sh` every day
+at 03:30 as root, with `flock` to avoid overlapping runs if a previous update
+is still in progress:
 
 ```cron
 30 3 * * * root flock -n /run/wp-update.lock /usr/local/bin/wp-update.sh >> /var/log/wp-update/cron.log 2>&1
 ```
 
-Log:
+Logs:
 
-- `/var/log/wp-update/cron.log` — output dell'ultima esecuzione via cron
-- `/var/log/wp-update/<timestamp>.log` — log dettagliato di ogni singolo run
+- `/var/log/wp-update/cron.log` — output of the last cron run
+- `/var/log/wp-update/<timestamp>.log` — detailed log of each single run
 
-## Sicurezza
+## Security
 
-Il vhost generato da `create` include gia':
+The vhost generated by `create` already includes:
 
-- blocco dell'esecuzione PHP dentro `wp-content/uploads/`
-- deny su `wp-config.php`, `xmlrpc.php`, file dotfile e `readme.html`/`license.txt`
-- `DISALLOW_FILE_EDIT` e aggiornamenti minori automatici in `wp-config.php`
-- rimozione dei plugin/contenuti di default (`hello`, `akismet`, post di esempio)
-- password di database e admin generate casualmente e salvate solo in
-  `/root/wp-sites/<dominio>.txt` (mai nella docroot)
+- PHP execution blocked inside `wp-content/uploads/`
+- deny on `wp-config.php`, `xmlrpc.php`, dotfiles and `readme.html`/`license.txt`
+- `DISALLOW_FILE_EDIT` and automatic minor updates in `wp-config.php`
+- removal of the default plugins/content (`hello`, `akismet`, sample post)
+- randomly generated database and admin passwords, saved only in
+  `/root/wp-sites/<domain>.txt` (never in the docroot)
 
-Lo script richiede sempre l'esecuzione come root: viene manipolato
-`/etc/nginx`, creato/rimosso database MySQL e gestiti utenti di sistema, quindi
-va eseguito solo su VPS di cui si ha pieno controllo.
+The script always requires being run as root: it manipulates `/etc/nginx`,
+creates/drops MySQL databases and manages system users, so it should only be
+run on VPSes you fully control.
 
-## Licenza
+## License
 
 [MIT](LICENSE)

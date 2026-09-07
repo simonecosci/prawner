@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
 #
-# wp-update.sh - aggiorna core, plugin e temi di tutte le installazioni
-#                WordPress presenti in /var/www/*/wordpress
+# wp-update.sh - updates core, plugins and themes of every WordPress
+#                installation found under /var/www/*/wordpress
 #
-# Per ogni sito:
-#   1. dump del DB + tar di plugins/themes/mu-plugins
-#   2. update core -> plugin -> temi -> update-db
-#   3. smoke test HTTP
-#   4. rollback automatico se lo smoke test fallisce
+# For each site:
+#   1. DB dump + tar of plugins/themes/mu-plugins
+#   2. update core -> plugins -> themes -> update-db
+#   3. HTTP smoke test
+#   4. automatic rollback if the smoke test fails
 #
-# Uso:
-#   ./wp-update.sh                      # aggiorna tutto
-#   ./wp-update.sh --dry-run            # mostra solo cosa verrebbe aggiornato
-#   ./wp-update.sh --site punto14.es    # un solo sito
-#   ./wp-update.sh --no-core            # solo plugin e temi
-#   ./wp-update.sh --skip-smoke         # salta il controllo HTTP (e il rollback)
+# Usage:
+#   ./wp-update.sh                      # update everything
+#   ./wp-update.sh --dry-run            # only show what would be updated
+#   ./wp-update.sh --site example.com   # a single site
+#   ./wp-update.sh --no-core            # plugins and themes only
+#   ./wp-update.sh --skip-smoke         # skip the HTTP check (and the rollback)
 #
 set -uo pipefail
 
 WWW_ROOT="${WWW_ROOT:-/var/www}"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/wp}"
 LOG_DIR="${LOG_DIR:-/var/log/wp-update}"
-KEEP_BACKUPS="${KEEP_BACKUPS:-3}"      # quanti set di backup tenere per sito
-MIN_FREE_MB="${MIN_FREE_MB:-1024}"     # spazio libero minimo richiesto
+KEEP_BACKUPS="${KEEP_BACKUPS:-3}"      # how many backup sets to keep per site
+MIN_FREE_MB="${MIN_FREE_MB:-1024}"     # minimum free space required
 CURL_TIMEOUT="${CURL_TIMEOUT:-30}"
 
 DRY_RUN=0
@@ -42,7 +42,7 @@ while [[ $# -gt 0 ]]; do
     --no-core)    DO_CORE=0; shift ;;
     --skip-smoke) SKIP_SMOKE=1; shift ;;
     -h|--help)    sed -n '2,20p' "$0"; exit 0 ;;
-    *)            echo "Opzione sconosciuta: $1" >&2; exit 2 ;;
+    *)            echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
 
@@ -54,12 +54,12 @@ log()  { printf '%s  %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"; }
 warn() { printf '%s  [WARN] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE" >&2; }
 err()  { printf '%s  [ERR ] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE" >&2; }
 
-# Esegue wp-cli con l'utente proprietario dell'installazione.
-# I file creati dagli update restano quindi di proprieta' corretta.
-# www-data e gli utenti ftp hanno HOME non scrivibile (/var/www, /usr/sbin/nologin).
-# Una cache condivisa non basta: wp-cli crea le sottocartelle (theme/, plugin/,
-# core/) con l'utente del primo run e gli altri owner non ci possono scrivere.
-# Quindi una cache per utente.
+# Runs wp-cli as the user owning the installation, so the files created by
+# the updates keep the correct ownership.
+# www-data and the ftp users have a non-writable HOME (/var/www, /usr/sbin/nologin).
+# A shared cache is not enough: wp-cli creates the subdirectories (theme/,
+# plugin/, core/) as the user of the first run and the other owners cannot
+# write into them. Hence one cache per user.
 WP_CLI_CACHE_ROOT="${WP_CLI_CACHE_ROOT:-/var/cache/wp-cli}"
 
 setup_cache_dir() {
@@ -84,7 +84,7 @@ require_cmds() {
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
-    err "comandi mancanti: ${missing[*]}"
+    err "missing commands: ${missing[*]}"
     exit 1
   fi
 }
@@ -93,7 +93,7 @@ check_disk() {
   local free_mb
   free_mb=$(df -Pm "$BACKUP_ROOT" | awk 'NR==2 {print $4}')
   if [[ "$free_mb" -lt "$MIN_FREE_MB" ]]; then
-    err "spazio libero insufficiente su $BACKUP_ROOT: ${free_mb}MB (minimo ${MIN_FREE_MB}MB)"
+    err "not enough free space on $BACKUP_ROOT: ${free_mb}MB (minimum ${MIN_FREE_MB}MB)"
     exit 1
   fi
 }
@@ -104,29 +104,29 @@ do_backup() {
   local dir="$BACKUP_ROOT/$SITE_SLUG/$STAMP"
   mkdir -p "$dir"
 
-  log "  backup DB -> $dir/db.sql.gz"
+  log "  DB backup -> $dir/db.sql.gz"
   if ! wp_run db export - --single-transaction --quick --default-character-set=utf8mb4 \
        | gzip -c > "$dir/db.sql.gz"; then
-    err "  dump del DB fallito, sito saltato"
+    err "  DB dump failed, site skipped"
     rm -rf "$dir"
     return 1
   fi
-  # gzip di un errore wp-cli produce un file minuscolo: sanity check
+  # gzipping a wp-cli error produces a tiny file: sanity check
   if [[ $(stat -c %s "$dir/db.sql.gz") -lt 1024 ]]; then
-    err "  dump del DB sospettosamente piccolo, sito saltato"
+    err "  DB dump suspiciously small, site skipped"
     rm -rf "$dir"
     return 1
   fi
 
-  log "  backup wp-content (plugins/themes/mu-plugins, esclusi uploads)"
+  log "  wp-content backup (plugins/themes/mu-plugins, uploads excluded)"
   tar -czf "$dir/wp-content.tar.gz" \
       -C "$SITE_PATH" \
       $( [[ -d "$SITE_PATH/wp-content/plugins"    ]] && echo wp-content/plugins ) \
       $( [[ -d "$SITE_PATH/wp-content/themes"     ]] && echo wp-content/themes ) \
       $( [[ -d "$SITE_PATH/wp-content/mu-plugins" ]] && echo wp-content/mu-plugins ) \
-      2>>"$LOG_FILE" || { err "  tar fallito"; return 1; }
+      2>>"$LOG_FILE" || { err "  tar failed"; return 1; }
 
-  # versione core prima dell'update, serve per il rollback
+  # core version before the update, needed for the rollback
   wp_run core version > "$dir/core.version" 2>/dev/null
 
   BACKUP_DIR="$dir"
@@ -137,7 +137,7 @@ prune_backups() {
   local site_dir="$BACKUP_ROOT/$SITE_SLUG"
   [[ -d "$site_dir" ]] || return 0
   ls -1dt "$site_dir"/*/ 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | while read -r old; do
-    log "  rimuovo backup vecchio: $old"
+    log "  removing old backup: $old"
     rm -rf "$old"
   done
 }
@@ -147,64 +147,64 @@ prune_backups() {
 smoke_test() {
   local url code body_file
   url=$(wp_run option get home | tr -d '\r\n')
-  [[ -z "$url" ]] && { warn "  home url non leggibile, smoke test saltato"; return 0; }
+  [[ -z "$url" ]] && { warn "  home url not readable, smoke test skipped"; return 0; }
 
   body_file=$(mktemp)
   code=$(curl -sS -L --max-time "$CURL_TIMEOUT" -o "$body_file" -w '%{http_code}' "$url" || echo 000)
 
   if [[ "$code" != "200" ]]; then
-    err "  smoke test: HTTP $code su $url"
+    err "  smoke test: HTTP $code on $url"
     rm -f "$body_file"; return 1
   fi
   if grep -qiE 'there has been a critical error|error establishing a database connection|Fatal error' "$body_file"; then
-    err "  smoke test: errore PHP/DB nella pagina"
+    err "  smoke test: PHP/DB error in the page"
     rm -f "$body_file"; return 1
   fi
   if [[ $(stat -c %s "$body_file") -lt 500 ]]; then
-    err "  smoke test: risposta troppo corta (${code}), possibile white screen"
+    err "  smoke test: response too short (${code}), possible white screen"
     rm -f "$body_file"; return 1
   fi
 
   log "  smoke test OK ($url -> $code)"
   rm -f "$body_file"
 
-  # Secondo controllo: wp-login.php. Plugin che toccano SSL, redirect o header
-  # rompono spesso il login lasciando la home perfettamente funzionante.
+  # Second check: wp-login.php. Plugins that touch SSL, redirects or headers
+  # often break the login while leaving the home page perfectly working.
   local login_code
   login_code=$(curl -sS -L --max-time "$CURL_TIMEOUT" -o /dev/null \
                     -w '%{http_code}' "$url/wp-login.php" || echo 000)
   if [[ "$login_code" != "200" ]]; then
-    err "  smoke test: wp-login.php risponde $login_code (redirect loop? SSL?)"
+    err "  smoke test: wp-login.php returns $login_code (redirect loop? SSL?)"
     return 1
   fi
-  log "  smoke test login OK"
+  log "  login smoke test OK"
   return 0
 }
 
 # ---------------------------------------------------------------- rollback
 
 do_rollback() {
-  warn "  ROLLBACK in corso da $BACKUP_DIR"
+  warn "  ROLLBACK in progress from $BACKUP_DIR"
 
   if [[ -f "$BACKUP_DIR/core.version" ]]; then
     local v; v=$(cat "$BACKUP_DIR/core.version")
-    log "  ripristino core $v"
+    log "  restoring core $v"
     wp_run core download --version="$v" --force --skip-content >/dev/null
   fi
 
-  log "  ripristino plugins/themes"
+  log "  restoring plugins/themes"
   tar -xzf "$BACKUP_DIR/wp-content.tar.gz" -C "$SITE_PATH" 2>>"$LOG_FILE"
   chown -R "$SITE_OWNER":"$SITE_GROUP" "$SITE_PATH/wp-content" 2>/dev/null
 
-  log "  ripristino DB"
+  log "  restoring DB"
   gunzip -c "$BACKUP_DIR/db.sql.gz" | wp_run db import - >/dev/null
 
   wp_run maintenance-mode deactivate >/dev/null 2>&1
 
   if smoke_test; then
-    warn "  rollback riuscito, sito tornato allo stato precedente"
+    warn "  rollback succeeded, site back to its previous state"
   else
-    err "  ROLLBACK NON RISOLUTIVO su $SITE_NAME - intervento manuale necessario"
+    err "  ROLLBACK DID NOT FIX $SITE_NAME - manual intervention required"
   fi
 }
 
@@ -220,7 +220,7 @@ update_site() {
   [[ "$pending_plugins" =~ ^[0-9]+$ ]] || pending_plugins=0
   [[ "$pending_themes"  =~ ^[0-9]+$ ]] || pending_themes=0
 
-  log "  da aggiornare: core=$pending_core plugin=$pending_plugins temi=$pending_themes"
+  log "  to update: core=$pending_core plugins=$pending_plugins themes=$pending_themes"
 
   if [[ $DRY_RUN -eq 1 ]]; then
     [[ "$pending_plugins" -gt 0 ]] && wp_run plugin list --update=available \
@@ -231,7 +231,7 @@ update_site() {
   fi
 
   if [[ "$pending_core" -eq 0 && "$pending_plugins" -eq 0 && "$pending_themes" -eq 0 ]]; then
-    log "  gia' aggiornato, niente da fare"
+    log "  already up to date, nothing to do"
     return 0
   fi
 
@@ -240,15 +240,15 @@ update_site() {
   wp_run maintenance-mode activate >/dev/null 2>&1
 
   if [[ $DO_CORE -eq 1 && "$pending_core" -gt 0 ]]; then
-    log "  update core"
+    log "  core update"
     wp_run core update | tee -a "$LOG_FILE"
   fi
   if [[ "$pending_plugins" -gt 0 ]]; then
-    log "  update plugin"
+    log "  plugin update"
     wp_run plugin update --all | tee -a "$LOG_FILE"
   fi
   if [[ "$pending_themes" -gt 0 ]]; then
-    log "  update temi"
+    log "  theme update"
     wp_run theme update --all | tee -a "$LOG_FILE"
   fi
 
@@ -277,9 +277,9 @@ log "=== wp-update start (dry-run=$DRY_RUN) ==="
 FAILED=()
 OK=()
 
-# Trova ogni installazione reale invece di assumere <dominio>/wordpress:
-# cosi' vengono presi anche wordpress-test e installazioni in root di dominio.
-# L'ordinamento mette per primi i path che contengono "test": canarino.
+# Find every real installation instead of assuming <domain>/wordpress:
+# this also picks up wordpress-test and installations at the domain root.
+# The sorting puts the paths containing "test" first: the canaries.
 mapfile -t CONFIGS < <(
   find "$WWW_ROOT" -mindepth 2 -maxdepth 3 -name wp-config.php \
        -not -path '*/wp-content/*' 2>/dev/null \
@@ -288,8 +288,8 @@ mapfile -t CONFIGS < <(
 
 for cfg in "${CONFIGS[@]}"; do
   SITE_PATH=$(dirname "$cfg")
-  SITE_NAME=${SITE_PATH#"$WWW_ROOT"/}          # es. simonecosci.com/wordpress-test
-  SITE_SLUG=${SITE_NAME//\//_}                 # es. simonecosci.com_wordpress-test
+  SITE_NAME=${SITE_PATH#"$WWW_ROOT"/}          # e.g. example.com/wordpress-test
+  SITE_SLUG=${SITE_NAME//\//_}                 # e.g. example.com_wordpress-test
 
   if [[ -n "$ONLY_SITE" && "$SITE_NAME" != *"$ONLY_SITE"* ]]; then
     continue
@@ -303,8 +303,8 @@ for cfg in "${CONFIGS[@]}"; do
   log "--- $SITE_NAME ($SITE_PATH, owner=$SITE_OWNER:$SITE_GROUP)"
 
   if ! wp_run core is-installed >/dev/null 2>&1; then
-    warn "  wp-cli non riesce a caricare l'installazione (DB down? wp-config?), salto"
-    FAILED+=("$SITE_NAME (non raggiungibile)")
+    warn "  wp-cli cannot load the installation (DB down? wp-config?), skipping"
+    FAILED+=("$SITE_NAME (unreachable)")
     continue
   fi
 
@@ -315,8 +315,8 @@ for cfg in "${CONFIGS[@]}"; do
   fi
 done
 
-log "=== fine: ${#OK[@]} ok, ${#FAILED[@]} falliti ==="
-[[ ${#FAILED[@]} -gt 0 ]] && err "siti con problemi: ${FAILED[*]}"
+log "=== done: ${#OK[@]} ok, ${#FAILED[@]} failed ==="
+[[ ${#FAILED[@]} -gt 0 ]] && err "sites with problems: ${FAILED[*]}"
 
-# exit code != 0 se qualcosa e' andato storto, utile per cron/monitoring
+# exit code != 0 if something went wrong, useful for cron/monitoring
 [[ ${#FAILED[@]} -eq 0 ]]

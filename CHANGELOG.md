@@ -1,24 +1,24 @@
 # Changelog
 
-Tutte le modifiche rilevanti a questo progetto sono documentate qui.
-Il formato segue [Keep a Changelog](https://keepachangelog.com/it/1.1.0/).
+All notable changes to this project are documented here.
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Non rilasciato]
+## [Unreleased]
 
-### Aggiunto
-- `wp-update.sh`: aggiornamento automatico di core, plugin e temi per tutti i
-  siti trovati in `$WWW_ROOT`, con backup pre-update, smoke test HTTP e
-  rollback automatico in caso di fallimento.
-- `cron.d/wp-update`: template per l'esecuzione giornaliera automatica via
-  `/etc/cron.d/wp-update` (con `flock` anti-sovrapposizione).
-- `install.sh --with-cron` / `uninstall.sh --with-cron`: installano/rimuovono
-  anche il cron di `wp-update.sh` insieme ai comandi.
+### Added
+- `wp-update.sh`: automatic core, plugin and theme updates for every site
+  found under `$WWW_ROOT`, with a pre-update backup, an HTTP smoke test and
+  automatic rollback on failure.
+- `cron.d/wp-update`: template for the automatic daily run via
+  `/etc/cron.d/wp-update` (with `flock` to prevent overlapping runs).
+- `install.sh --with-cron` / `uninstall.sh --with-cron`: install/remove the
+  `wp-update.sh` cron job along with the commands.
 
 ## [1.0.0] - 2026-09-07
 
-### Aggiunto
-- Comando `wp-site.sh list`: elenca i siti WordPress configurati su nginx (dominio, docroot, owner, stato enable, scadenza TLS) e segnala docroot orfani.
-- Comando `wp-site.sh create`: provisioning completo di un nuovo sito (utente di sistema, database MySQL, download e installazione WordPress via WP-CLI, permessi, vhost nginx con hardening) con verifica DNS preventiva.
-- Comando `wp-site.sh cert`: richiesta/rinnovo certificato TLS via certbot con verifica DNS e allineamento automatico di `home`/`siteurl` in WordPress.
-- Comando `wp-site.sh remove`: rimozione guidata e confermata di un sito, con backup completo (database + file + vhost) prima di procedere.
-- Script `install.sh` / `uninstall.sh` per installare/rimuovere il comando su un VPS.
+### Added
+- `wp-site.sh list` command: lists the WordPress sites configured in nginx (domain, docroot, owner, enabled state, TLS expiry) and reports orphaned docroots.
+- `wp-site.sh create` command: full provisioning of a new site (system user, MySQL database, WordPress download and install via WP-CLI, permissions, hardened nginx vhost) with an upfront DNS check.
+- `wp-site.sh cert` command: TLS certificate request/renewal via certbot with a DNS check and automatic alignment of WordPress `home`/`siteurl`.
+- `wp-site.sh remove` command: guided, confirmed removal of a site, with a full backup (database + files + vhost) taken before proceeding.
+- `install.sh` / `uninstall.sh` scripts to install/remove the command on a VPS.

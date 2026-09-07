@@ -4,7 +4,7 @@ Thumbs.db
 *.swp
 *~
 
-# eventuali dump o backup locali di test
+# local test dumps or backups
 *.sql
 *.sql.gz
 *.tar.gz
