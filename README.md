@@ -37,15 +37,15 @@ certbot** stack:
 
 ## Conventions
 
-| What        | Path / value                                             |
-|-------------|----------------------------------------------------------|
-| Docroot     | `/var/www/<domain>/wordpress/`                            |
-| Vhost       | `/etc/nginx/sites-available/<slug>` (no extension)        |
-| Enable      | symlink in `/etc/nginx/sites-enabled/`                    |
-| PHP-FPM     | `unix:/run/php/php8.1-fpm.sock` (pool `www-data`)         |
-| TLS         | `certbot --nginx`, rewrites the vhost adding `:443`       |
-| Credentials | saved in `/root/wp-sites/<domain>.txt` (mode 600)         |
-| Backup      | `/var/backups/wp-site/<domain>-<timestamp>/`              |
+| What             | Path / value                                         |
+|------------------|------------------------------------------------------|
+| Docroot          | `/var/www/<domain>/wordpress/`                       |
+| Vhost            | `/etc/nginx/sites-available/<slug>` (no extension)   |
+| Enable           | symlink in `/etc/nginx/sites-enabled/`               |
+| PHP-FPM          | `unix:/run/php/php8.1-fpm.sock` (pool `www-data`)    |
+| TLS              | `certbot --nginx`, rewrites the vhost adding `:443`  |
+| Credentials      | saved in `/root/wp-sites/<domain>.txt` (mode 600)    |
+| Backup           | `/var/backups/wp-site/<domain>-<timestamp>/`         |
 | Media quarantine | `/var/backups/wp-media/<site>/<stamp>/`              |
 
 ## Requirements
