@@ -13,6 +13,10 @@ certbot** stack:
   with a coherent set of sites that is easy to inspect.
 - **`wp-update.sh`** — automatic daily updates of core, plugins and themes on
   every site, with a backup and an automatic rollback if something breaks.
+- **`wp-media-clean.sh`** — reclaims disk space by moving unused media into a
+  reversible quarantine: attachments nothing references any more, files under
+  `uploads/` that belong to no attachment, and thumbnails for image sizes the
+  theme no longer registers.
 
 ## wp-site.sh — site provisioning
 
@@ -42,6 +46,7 @@ certbot** stack:
 | TLS         | `certbot --nginx`, rewrites the vhost adding `:443`       |
 | Credentials | saved in `/root/wp-sites/<domain>.txt` (mode 600)         |
 | Backup      | `/var/backups/wp-site/<domain>-<timestamp>/`              |
+| Media quarantine | `/var/backups/wp-media/<site>/<stamp>/`              |
 
 ## Requirements
 
@@ -69,9 +74,9 @@ cd prawner
 sudo ./install.sh
 ```
 
-This copies `bin/wp-site.sh` and `bin/wp-update.sh` into `/usr/local/bin/` and
-reports any missing dependencies. To install the daily `wp-update.sh` cron job
-at the same time:
+This copies `bin/wp-site.sh`, `bin/wp-update.sh` and `bin/wp-media-clean.sh`
+into `/usr/local/bin/` and reports any missing dependencies. To install the
+daily `wp-update.sh` cron job at the same time:
 
 ```bash
 sudo ./install.sh --with-cron
@@ -88,6 +93,7 @@ To use the commands without installing them, just run them from the repo:
 ```bash
 sudo ./bin/wp-site.sh list
 sudo ./bin/wp-update.sh --dry-run
+sudo ./bin/wp-media-clean.sh --site example.com
 ```
 
 ## Usage — wp-site.sh
@@ -195,6 +201,135 @@ Logs:
 
 - `/var/log/wp-update/cron.log` — output of the last cron run
 - `/var/log/wp-update/<timestamp>.log` — detailed log of each single run
+
+## wp-media-clean.sh — media cleanup
+
+Reports, by default. It only moves something when `--apply` is given, and even
+then nothing is deleted: files go to `/var/backups/wp-media/<site>/<stamp>/`
+together with a dump of the affected database rows, and `--restore` puts them
+back. Real deletion happens only when a set falls out of the `KEEP_QUARANTINE`
+retention window (three sets per site).
+
+### Before you run `--apply` on a real site
+
+This tool was built and reviewed without a WordPress installation, MySQL,
+wp-cli, `sudo` or `/var/www` to test against: every check below could only be
+verified with unit tests over pure string logic and hand-built fixtures that
+stub `wp_run`, `chown` and `stat`, never against a real site. None of it is a
+substitute for looking at real data. Work through this checklist on a real VPS
+— a test site, not production — before trusting `--apply` with data you care
+about.
+
+**wp-cli assumptions the collectors depend on:**
+
+- [ ] `wp db query ... --skip-column-names` actually suppresses the header row
+      (every collector query relies on this to avoid a stray column-name line
+      in its output):
+      `sudo -u <owner> wp --path=<path> db query "SELECT 1" --skip-column-names`
+      should print a bare `1`, nothing else.
+- [ ] `wp media image-size --format=csv` prints one registered size per row,
+      name in the first column (`collect_registered_sizes` reads it that way):
+      `sudo -u <owner> wp --path=<path> media image-size --format=csv` should
+      show a header row followed by `thumbnail`, `medium`, `large` and any
+      custom sizes as the first field of each row.
+- [ ] `wp db export - --where=... --no-create-info --skip-add-drop-table`
+      passes `--where` through to `mysqldump` and omits the `CREATE TABLE`
+      statement (`quarantine_site` dumps the rows it is about to delete this
+      way, before deleting anything):
+      `sudo -u <owner> wp --path=<path> db export - --tables=<prefix>posts --where="ID=1" --no-create-info --skip-add-drop-table | head`
+      should show only `INSERT INTO` statements, no `CREATE TABLE`.
+
+**Collector sanity, on the report only, no `--apply`:**
+
+- [ ] the attachment inventory count in the log roughly matches the count
+      shown in wp-admin → Media.
+- [ ] the registered size list includes `thumbnail`, `medium` and `large`.
+- [ ] the ID set is non-empty on any site that uses featured images. An empty
+      haystack or an empty inventory is a bug, not a clean site — stop and
+      investigate rather than proceeding to `--apply`.
+
+**Classification, before `--apply` is ever used:**
+
+- [ ] pick one file from the report's "stale thumbs" list and confirm with
+      `grep -c "$(basename FILE)"` over the site's `post_content` that nothing
+      references it.
+- [ ] confirm the site's logo, favicon and a WooCommerce product gallery image
+      are **not** listed under "attachments".
+- [ ] confirm a `-scaled.jpg` upload and its untouched original appear in
+      neither list.
+- [ ] confirm an image used only in a draft post appears in neither list.
+
+If any of those four appears where it shouldn't, stop and fix the
+classification before going near `--apply`.
+
+**Quarantine and retention, on a test site only — never production on the
+first run:**
+
+- [ ] `wp-media-clean.sh --site <test-domain>` (report), then
+      `wp-media-clean.sh --site <test-domain> --apply`.
+- [ ] `/var/backups/wp-media/<site>/<stamp>/` contains `files/`,
+      `manifest.tsv`, and non-empty `rows/posts.sql` and `rows/postmeta.sql`.
+- [ ] the removed attachments no longer appear in wp-admin.
+- [ ] the home page and a post that used one of the removed images still
+      render correctly.
+- [ ] run `--apply` four times in a row and confirm only three quarantine sets
+      survive (the `KEEP_QUARANTINE` retention window).
+
+**Restore:**
+
+- [ ] `--list-quarantine --site <test-domain>` shows the set with its item
+      count and size.
+- [ ] `--restore <stamp> --site <test-domain>` puts every file back, reimports
+      the database rows, and the previously removed attachments are visible
+      again in wp-admin with working thumbnails.
+- [ ] run the same `--restore` a second time: already-restored files are
+      recognised as such (not reported as conflicts) and only get their
+      ownership reapplied; the rows get imported again too, and a duplicate-key
+      failure at that point is an expected, safe outcome, not data loss —
+      confirm nothing is corrupted either way.
+- [ ] force a quarantine set into the manifest-less state (remove
+      `manifest.tsv` from a set that still has `rows/`) and confirm `--restore`
+      still imports the rows instead of refusing.
+- [ ] confirm no `wp media regenerate` call is ever made during a restore — it
+      would strip metadata for sizes no longer registered, undoing exactly
+      what the restore just put back.
+
+```bash
+wp-media-clean.sh                                   # report every site
+wp-media-clean.sh --site example.com                # report one site
+wp-media-clean.sh --site example.com --apply        # move to quarantine
+wp-media-clean.sh --only thumbs --apply             # one class only
+wp-media-clean.sh --list-quarantine --site example.com
+wp-media-clean.sh --restore 20260908-143000 --site example.com
+```
+
+An image counts as used when its filename appears anywhere in the database —
+post content, custom fields, options, term and user meta, including drafts,
+revisions, scheduled posts and the trash — or in the theme and plugin files, or
+when its attachment ID appears as a reference (featured image, ACF field,
+WooCommerce gallery). Both tests err towards keeping the file: the
+classification is deliberately biased so that an uncertain file is kept, never
+removed.
+
+Attachments uploaded in the last 30 days are skipped, so that images not yet
+inserted anywhere survive. Change it with `--min-age`.
+
+Read the report before running `--apply` the first time on a site. Images
+referenced only from outside WordPress — a CDN manifest, another site
+hotlinking — are invisible to the tool, which is why removal is a quarantine
+and not a delete.
+
+### Environment variables
+
+| Variable              | Default                            |
+|------------------------|------------------------------------|
+| `WWW_ROOT`             | `/var/www`                         |
+| `QUARANTINE_ROOT`      | `/var/backups/wp-media`            |
+| `LOG_DIR`              | `/var/log/wp-media-clean`          |
+| `WP_CLI_CACHE_ROOT`    | `/var/cache/wp-cli`                |
+| `KEEP_QUARANTINE`      | `3` (quarantine sets kept per site) |
+| `MIN_AGE_DAYS`         | `30` (same as `--min-age`)          |
+| `EXCLUDE_UPLOAD_DIRS`  | `woocommerce_uploads wpforms backups wp-personal-data-exports elementor cache` — directory names under `uploads/`, at any depth, that the orphan-file scan skips |
 
 ## Security
 

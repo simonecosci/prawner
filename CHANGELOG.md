@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `wp-media-clean.sh`: reclaims disk space by moving unused attachments,
+  orphan uploads and stale thumbnails into a reversible quarantine, with a
+  dump of the affected database rows and a `--restore` command; real deletion
+  only happens once a quarantine set falls out of its retention window.
 - `wp-update.sh`: automatic core, plugin and theme updates for every site
   found under `$WWW_ROOT`, with a pre-update backup, an HTTP smoke test and
   automatic rollback on failure.

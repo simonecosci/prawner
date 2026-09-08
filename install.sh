@@ -26,7 +26,7 @@ fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
-for name in wp-site.sh wp-update.sh; do
+for name in wp-site.sh wp-update.sh wp-media-clean.sh; do
   SRC="$SCRIPT_DIR/bin/$name"
   DEST="$PREFIX/$name"
   [[ -f "$SRC" ]] || { echo "[ERROR] cannot find $SRC" >&2; exit 1; }
@@ -56,6 +56,7 @@ fi
 echo
 echo "Usage: wp-site.sh list | create <domain> | cert <domain> | remove <domain>"
 echo "       wp-update.sh [--dry-run] [--site <domain>] [--no-core] [--skip-smoke]"
+echo "       wp-media-clean.sh [--site <domain>] [--apply] [--only <class>]"
 if [[ $WITH_CRON -eq 0 ]]; then
   echo
   echo "For automatic daily updates: sudo ./install.sh --with-cron"
