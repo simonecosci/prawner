@@ -293,27 +293,37 @@ collect_inventory() {
 # generated sizes survive only in this meta key, under WordPress's own
 # "Restore original image" feature. Emitted under the __backup pseudo size so
 # classify() never treats them as stale.
+#
+# A 4th column carries the attachment's own subdirectory under the uploads
+# basedir (dirname of _wp_attached_file, empty for a root-level upload).
+# sizemap.tsv carries no directory in column 3, its filename column, so two
+# attachments that happen to generate a same-named size in different months
+# are otherwise indistinguishable; the thumbnail-attribution lookup in
+# quarantine_site matches on this column too so it cannot pick the wrong one.
 collect_size_map() {
   wp_run eval '
     global $wpdb;
     $ids = $wpdb->get_col( "SELECT ID FROM {$wpdb->posts} WHERE post_type = \"attachment\"" );
     foreach ( $ids as $id ) {
+      $attached = get_post_meta( $id, "_wp_attached_file", true );
+      $dir = $attached ? dirname( $attached ) : "";
+      if ( $dir === "." ) { $dir = ""; }
       $m = wp_get_attachment_metadata( $id );
       if ( is_array( $m ) && ! empty( $m["original_image"] ) ) {
-        echo $id . "\t__original\t" . $m["original_image"] . "\n";
+        echo $id . "\t__original\t" . $m["original_image"] . "\t" . $dir . "\n";
       }
       $backup = get_post_meta( $id, "_wp_attachment_backup_sizes", true );
       if ( is_array( $backup ) ) {
         foreach ( $backup as $b ) {
           if ( ! empty( $b["file"] ) ) {
-            echo $id . "\t__backup\t" . $b["file"] . "\n";
+            echo $id . "\t__backup\t" . $b["file"] . "\t" . $dir . "\n";
           }
         }
       }
       if ( ! is_array( $m ) || empty( $m["sizes"] ) || ! is_array( $m["sizes"] ) ) { continue; }
       foreach ( $m["sizes"] as $name => $s ) {
         if ( empty( $s["file"] ) ) { continue; }
-        echo $id . "\t" . $name . "\t" . $s["file"] . "\n";
+        echo $id . "\t" . $name . "\t" . $s["file"] . "\t" . $dir . "\n";
       }
     }
   ' > "$WORK/sizemap.tsv" || warn "  cannot read the attachment metadata"
@@ -364,7 +374,7 @@ collect_names() {
     [[ "$enc" == "$base" ]] || printf '%s\n' "$enc" >> "$out"
   done < "$WORK/inventory.tsv"
 
-  while IFS=$'\t' read -r _ _ fname; do
+  while IFS=$'\t' read -r _ _ fname _; do
     [[ -n "$fname" ]] || continue
     printf '%s\n' "$fname" >> "$out"
     enc=$(urlencode_name "$fname")
@@ -399,6 +409,14 @@ EOF
 }
 
 parse_args() {
+  # KEEP_QUARANTINE only ever comes from the environment (no --flag for it),
+  # but it still needs validating before prune_quarantine does arithmetic
+  # with it: a non-numeric value errors out the $(( )) below, and 0 means
+  # "keep nothing", which deletes the quarantine set this very run just
+  # created, seconds after the files landed in it.
+  [[ "$KEEP_QUARANTINE" =~ ^[0-9]+$ && "$KEEP_QUARANTINE" -ge 1 ]] \
+    || die "KEEP_QUARANTINE must be an integer >= 1 (got: $KEEP_QUARANTINE)"
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --site)            ONLY_SITE="${2:-}"; [[ -n "$ONLY_SITE" ]] || die "--site requires a value"; shift 2 ;;
@@ -679,6 +697,12 @@ clean_site() {
 # so that --restore is a plain move back.
 qmove() {
   local src="$1" class="$2" att="$3" rel dest
+  # A path that reaches qmove a second time in the same run (a stale thumb
+  # that is also a size of a doomed attachment, say) has no source left the
+  # second time around: without this check, "dest exists and src is gone"
+  # below cannot tell that apart from a genuine no-clobber skip, and would
+  # record a manifest line for a file that never moved on this call.
+  [[ -e "$src" ]] || { warn "  missing, not moved: $src"; return 1; }
   rel="${src#"$SITE_PATH"/}"
   dest="$QDIR/files/$rel"
   mkdir -p "$(dirname "$dest")"
@@ -699,6 +723,10 @@ prune_quarantine() {
   local site_dir="$QUARANTINE_ROOT/$SITE_SLUG" old
   [[ -d "$site_dir" ]] || return 0
   ls -1dt "$site_dir"/*/ 2>/dev/null | tail -n +$((KEEP_QUARANTINE + 1)) | while read -r old; do
+    # Belt and braces: never remove the set this very run just created, no
+    # matter what KEEP_QUARANTINE computes to. This is the only code path in
+    # the whole program that deletes anything for real.
+    [[ "${old%/}" == "$QDIR" ]] && continue
     log "  pruning old quarantine set: $old"
     rm -rf "$old"
   done
@@ -709,7 +737,9 @@ quarantine_site() {
   mkdir -p "$QDIR/files" "$QDIR/rows"
   : > "$QDIR/manifest.tsv"
 
-  local ids id rel dir fname f sname
+  local ids id rel dir fname f sname move_ok
+  local has_rows_posts has_rows_postmeta footer_posts footer_postmeta dump_ok
+  local thumb_ids thumb_dir
 
   # --- attachments. Order matters: dump the rows, then move the files, then
   # let WordPress delete the post. Deleting first would take the files with it;
@@ -724,21 +754,56 @@ quarantine_site() {
       --no-create-info --skip-add-drop-table > "$QDIR/rows/postmeta.sql"
 
     # The exit status of wp_run is not the test here: a dump that fails partway
-    # can still exit 0 and leave a truncated file. Non-empty is what matters,
-    # and without both dumps the removal must not happen at all.
+    # can still exit 0 and leave a truncated file. Non-empty is necessary but
+    # not sufficient either: mysqldump writes a comment header before any row,
+    # so a dump that dies right after the header is non-empty and would pass
+    # a plain -s test while carrying zero rows.
+    #
+    # Two independent checks, both required: at least one INSERT INTO in each
+    # dump (no rows captured is refused outright), and, if wp db export emits
+    # a "-- Dump completed" footer, it must be present in both dumps or in
+    # neither (present in only one means that one was cut short). If neither
+    # dump carries the footer, this build of wp-cli/mysqldump does not emit
+    # it, so that check is skipped and only the INSERT test gates the removal.
+    dump_ok=0
     if [[ ! -s "$QDIR/rows/posts.sql" || ! -s "$QDIR/rows/postmeta.sql" ]]; then
       warn "  the row dump failed or is empty: attachments left untouched"
     else
+      grep -q '^INSERT INTO' "$QDIR/rows/posts.sql"    && has_rows_posts=1    || has_rows_posts=0
+      grep -q '^INSERT INTO' "$QDIR/rows/postmeta.sql" && has_rows_postmeta=1 || has_rows_postmeta=0
+      grep -q -- '-- Dump completed' "$QDIR/rows/posts.sql"    && footer_posts=1    || footer_posts=0
+      grep -q -- '-- Dump completed' "$QDIR/rows/postmeta.sql" && footer_postmeta=1 || footer_postmeta=0
+
+      if [[ $has_rows_posts -eq 0 || $has_rows_postmeta -eq 0 ]]; then
+        warn "  the row dump captured no rows: attachments left untouched"
+      elif [[ $footer_posts -ne $footer_postmeta ]]; then
+        warn "  one row dump looks truncated (completion footer in one but not the other): attachments left untouched"
+      else
+        [[ $footer_posts -eq 0 ]] && warn "  wp db export does not emit a completion footer here, proceeding on the INSERT check alone"
+        dump_ok=1
+      fi
+    fi
+
+    if [[ $dump_ok -eq 1 ]]; then
       while IFS=$'\t' read -r id rel; do
         dir=$(dirname "$rel")
-        qmove "$UPLOADS_DIR/$rel" attachment "$id"
+        move_ok=1
+        qmove "$UPLOADS_DIR/$rel" attachment "$id" || move_ok=0
         # every generated size of this attachment
-        awk -F'\t' -v i="$id" '$1 == i { print $3 }' "$WORK/sizemap.tsv" \
-          | while IFS= read -r fname; do
-              [[ -f "$UPLOADS_DIR/$dir/$fname" ]] && qmove "$UPLOADS_DIR/$dir/$fname" attachment "$id"
-            done
-        wp_run post delete "$id" --force >/dev/null 2>&1 \
-          || warn "  wp post delete $id failed, the row is still there"
+        while IFS= read -r fname; do
+          if [[ -f "$UPLOADS_DIR/$dir/$fname" ]]; then
+            qmove "$UPLOADS_DIR/$dir/$fname" attachment "$id" || move_ok=0
+          fi
+        done < <(awk -F'\t' -v i="$id" '$1 == i { print $3 }' "$WORK/sizemap.tsv")
+        # A file that failed to move is still on disk and the row is still
+        # the only record of it; deleting the post here would leave
+        # wp_delete_attachment nothing to unlink and no way back for it.
+        if [[ $move_ok -eq 1 ]]; then
+          wp_run post delete "$id" --force </dev/null >/dev/null 2>&1 \
+            || warn "  wp post delete $id failed, the row is still there"
+        else
+          warn "  not every file for attachment $id moved, leaving the row in place"
+        fi
       done < "$WORK/doomed-attachments.tsv"
       log "  quarantined $(wc -l < "$WORK/doomed-attachments.tsv") attachments"
     fi
@@ -757,8 +822,15 @@ quarantine_site() {
     : > "$WORK/thumb-sizes.tsv"
     while IFS= read -r f; do
       fname=$(basename "$f")
-      id=$(awk -F'\t' -v n="$fname" '$3 == n { print $1; exit }' "$WORK/sizemap.tsv")
-      sname=$(awk -F'\t' -v n="$fname" '$3 == n { print $2; exit }' "$WORK/sizemap.tsv")
+      # sizemap.tsv carries no directory in its filename column, so a
+      # same-named size from two different attachments (two months' uploads
+      # both producing photo-150x150.jpg, say) is only disambiguated by also
+      # matching the attachment's own subdirectory, sizemap's 4th column,
+      # against this thumbnail's actual directory on disk.
+      thumb_dir=$(dirname "${f#"$UPLOADS_DIR"/}")
+      [[ "$thumb_dir" == "." ]] && thumb_dir=""
+      id=$(awk -F'\t' -v n="$fname" -v d="$thumb_dir" '$3 == n && $4 == d { print $1; exit }' "$WORK/sizemap.tsv")
+      sname=$(awk -F'\t' -v n="$fname" -v d="$thumb_dir" '$3 == n && $4 == d { print $2; exit }' "$WORK/sizemap.tsv")
       qmove "$f" thumb "${id:--}" || continue
       [[ -n "$id" && -n "$sname" ]] && printf '%s\t%s\n' "$id" "$sname" >> "$WORK/thumb-sizes.tsv"
     done < "$WORK/doomed-thumbs.txt"
@@ -766,6 +838,18 @@ quarantine_site() {
 
     if [[ -s "$WORK/thumb-sizes.tsv" ]]; then
       cp "$WORK/thumb-sizes.tsv" "$QDIR/rows/thumb-sizes.tsv"
+
+      # Capture the pre-edit metadata row too: unset() below only removes a
+      # size name from the array, it does not tell us the file/width/height
+      # that size once had, so without this dump the metadata edit is the one
+      # mutation in the whole program that would not round-trip.
+      thumb_ids=$(cut -f1 "$WORK/thumb-sizes.tsv" | sort -u | paste -sd, -)
+      wp_run db export - --tables="${PREFIX}postmeta" \
+        --where="post_id IN ($thumb_ids) AND meta_key='_wp_attachment_metadata'" \
+        --no-create-info --skip-add-drop-table > "$QDIR/rows/thumb-postmeta.sql"
+      [[ -s "$QDIR/rows/thumb-postmeta.sql" ]] \
+        || warn "  cannot dump the pre-edit attachment metadata, restoring thumbnail sizes may be incomplete"
+
       wp_run eval "
         \$rows = array_filter( explode( \"\n\", file_get_contents( '$QDIR/rows/thumb-sizes.tsv' ) ) );
         \$by_id = array();
@@ -784,8 +868,11 @@ quarantine_site() {
   fi
 
   if [[ ! -s "$QDIR/manifest.tsv" ]]; then
-    rmdir -p "$QDIR/files" "$QDIR/rows" 2>/dev/null
-    rm -rf "$QDIR"
+    # Plain rmdir, never rm -rf: it refuses on a non-empty directory, so if a
+    # row dump is sitting in rows/ (every qmove for a doomed attachment failed,
+    # say, with the dumps already on disk) the teardown simply does not
+    # happen, instead of taking the only copy of those rows down with it.
+    rmdir "$QDIR/files" "$QDIR/rows" "$QDIR" 2>/dev/null
     log "  nothing to quarantine"
     return 0
   fi
