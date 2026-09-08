@@ -426,7 +426,15 @@ parse_args() {
       --no-scan-files)   SCAN_FILES=0; shift ;;
       --list-quarantine) ACTION="list-quarantine"; shift ;;
       --restore)         ACTION="restore"; RESTORE_STAMP="${2:-}"
-                         [[ -n "$RESTORE_STAMP" ]] || die "--restore requires a quarantine stamp"; shift 2 ;;
+                         [[ -n "$RESTORE_STAMP" ]] || die "--restore requires a quarantine stamp"
+                         # Interpolated straight into a path under QUARANTINE_ROOT while
+                         # running as root: anything other than the stamp format
+                         # quarantine_site itself generates (date +%Y%m%d-%H%M%S) is
+                         # rejected outright, rather than letting something like
+                         # "../../etc" escape the site's own quarantine directory.
+                         [[ "$RESTORE_STAMP" =~ ^[0-9]{8}-[0-9]{6}$ ]] \
+                           || die "--restore takes a quarantine stamp of the form YYYYMMDD-HHMMSS (got: $RESTORE_STAMP)"
+                         shift 2 ;;
       -h|--help)         usage; exit 0 ;;
       *)                 die "unknown option: $1 (try --help)" ;;
     esac
@@ -913,7 +921,17 @@ list_quarantine_site() {
   [[ -d "$site_dir" ]] || { log "  no quarantine set"; return 0; }
   for d in "$site_dir"/*/; do
     [[ -d "$d" ]] || continue
-    n=$(wc -l < "$d/manifest.tsv" 2>/dev/null || echo 0)
+    # `n=$(wc -l < "$d/manifest.tsv" 2>/dev/null || echo 0)` looks like it
+    # covers a manifest-less set, but it does not: the `<` redirection is
+    # opened before wc even runs, so a missing file fails the redirection
+    # itself and prints a raw "No such file or directory" to stderr right
+    # there -- the 2>/dev/null on the command line is too late to catch it.
+    # Guard on -s first instead of relying on the redirection to fail softly.
+    if [[ -s "$d/manifest.tsv" ]]; then
+      n=$(wc -l < "$d/manifest.tsv")
+    else
+      n=0
+    fi
     log "  $(basename "$d")  $n items  $(du -sh "$d" 2>/dev/null | cut -f1)"
   done
 }
@@ -922,34 +940,101 @@ restore_site() {
   local qdir="$QUARANTINE_ROOT/$SITE_SLUG/$RESTORE_STAMP"
   [[ -d "$qdir" ]] || { warn "  no quarantine set $RESTORE_STAMP for this site"; return 1; }
 
+  # failures counts real problems in either phase (a file that would not
+  # move, a chown that did not take, a row import that failed). It is what
+  # decides whether this function is allowed to say "ok" and tell the
+  # operator the quarantine set is now disposable -- a bare warn() on its own
+  # changes nothing about the return value, so without this counter every one
+  # of those problems could still end in a false "restored" report.
+  local class rel att conflicts=0 failures=0
+
   # A missing or empty manifest is not an error: quarantine_site's own
   # teardown removes an empty manifest.tsv while leaving a populated rows/
   # behind it (every file move failed but the row dumps already landed), so
   # that combination is reachable and legitimate. It just means there is
   # nothing to move back; the row import below still runs.
-  local class rel att conflicts=0
   if [[ -s "$qdir/manifest.tsv" ]]; then
-    # Refuse rather than overwrite: a destination that already exists means
-    # something was re-uploaded since, and clobbering it would be a second
-    # data loss on top of whatever made the restore necessary. Check every
-    # conflict before moving anything, so a partial restore never happens.
+    # A restore run a second time, after a first run already moved every
+    # file back, is not a conflict: if every destination in the manifest is
+    # already in place AND quarantine's files/ holds nothing left to move,
+    # that is the unambiguous signature of "the file phase already
+    # happened" (this same restore run again, or an earlier attempt that got
+    # the files across but failed before the row import). Recognise that
+    # case and go straight to the row import instead of reporting every line
+    # as a conflict and refusing outright -- otherwise a restore that fails
+    # only on the database step can never be completed by re-running it,
+    # which is exactly the recovery path this function exists to offer.
+    local all_present=1
     while IFS=$'\t' read -r class rel att; do
-      [[ -e "$SITE_PATH/$rel" ]] && { warn "  conflict, already present: $rel"; conflicts=$((conflicts + 1)); }
-    done < "$qdir/manifest.tsv"
-    [[ $conflicts -eq 0 ]] || { warn "  $conflicts conflicts, restore aborted"; return 1; }
-
-    while IFS=$'\t' read -r class rel att; do
-      mkdir -p "$(dirname "$SITE_PATH/$rel")"
-      mv -n "$qdir/files/$rel" "$SITE_PATH/$rel" || warn "  cannot restore $rel"
+      [[ -n "$rel" ]] || continue
+      [[ -e "$SITE_PATH/$rel" ]] || { all_present=0; break; }
     done < "$qdir/manifest.tsv"
 
-    chown -R "$SITE_OWNER":"$SITE_GROUP" "$SITE_PATH/wp-content/uploads" 2>/dev/null
+    local files_left
+    files_left=$(find "$qdir/files" -type f -print -quit 2>/dev/null)
+
+    if [[ $all_present -eq 1 && -z "$files_left" ]]; then
+      log "  every file is already at its destination and quarantine/files is empty: already restored, importing the rows only"
+    else
+      # Refuse rather than overwrite: a destination that already exists means
+      # something was re-uploaded since, and clobbering it would be a second
+      # data loss on top of whatever made the restore necessary. Check every
+      # conflict before moving anything, so a partial restore never happens.
+      while IFS=$'\t' read -r class rel att; do
+        [[ -n "$rel" ]] || continue
+        [[ -e "$SITE_PATH/$rel" ]] && { warn "  conflict, already present: $rel"; conflicts=$((conflicts + 1)); }
+      done < "$qdir/manifest.tsv"
+      [[ $conflicts -eq 0 ]] || { warn "  $conflicts conflicts, restore aborted"; return 1; }
+
+      local destdir dir_existed
+      while IFS=$'\t' read -r class rel att; do
+        [[ -n "$rel" ]] || continue
+        destdir="$(dirname "$SITE_PATH/$rel")"
+        dir_existed=1
+        [[ -d "$destdir" ]] || dir_existed=0
+        mkdir -p "$destdir"
+
+        # mv -n exits 0 even when it silently skips an existing destination
+        # (GNU coreutils) -- the same trap qmove guards against, twenty lines
+        # earlier in this file, when moving files INTO quarantine. A
+        # destination created between the conflict scan above and this move
+        # (a concurrent upload on a live site) is exactly the race that scan
+        # cannot close, and the skip it causes here is invisible to an exit
+        # status check. Only the filesystem afterwards can tell a real move
+        # from a no-clobber skip: the move only actually happened if the
+        # destination now exists and the quarantine copy is gone.
+        mv -n "$qdir/files/$rel" "$SITE_PATH/$rel" 2>>"$LOG_FILE"
+        if [[ -e "$SITE_PATH/$rel" && ! -e "$qdir/files/$rel" ]]; then
+          # Chown exactly what this restore touched, from the manifest's own
+          # path, rather than a guessed "$SITE_PATH/wp-content/uploads": a
+          # custom WP_CONTENT_DIR/UPLOADS constant or a legacy upload_path
+          # makes that guess wrong, chown fails on it, and 2>/dev/null used
+          # to swallow that silently, leaving the restored files root-owned.
+          # When mkdir -p above had to create the destination directory, it
+          # is new and holds only what this loop puts in it, so recursing
+          # into it is still exactly-scoped.
+          if [[ $dir_existed -eq 0 ]]; then
+            chown -R "$SITE_OWNER":"$SITE_GROUP" "$destdir" 2>>"$LOG_FILE" \
+              || { warn "  cannot chown $destdir to $SITE_OWNER:$SITE_GROUP"; failures=$((failures + 1)); }
+          else
+            chown "$SITE_OWNER":"$SITE_GROUP" "$SITE_PATH/$rel" 2>>"$LOG_FILE" \
+              || { warn "  cannot chown $rel to $SITE_OWNER:$SITE_GROUP"; failures=$((failures + 1)); }
+          fi
+        else
+          warn "  cannot restore $rel"
+          failures=$((failures + 1))
+        fi
+      done < "$qdir/manifest.tsv"
+    fi
   else
     log "  no manifest (or it is empty): nothing to move back, importing rows only"
   fi
 
-  # Files first, then rows: a failure between the two leaves files present and
-  # rows absent, which is recoverable by re-running the restore.
+  # Files first, then rows: a real failure between the two still leaves files
+  # present and rows absent, and that is recoverable by re-running the
+  # restore -- the "already restored" check above is exactly what makes the
+  # second run reach the row import instead of refusing on the conflicts it
+  # would otherwise see for every file now sitting at its destination.
   #
   # thumb-postmeta.sql carries the pre-edit _wp_attachment_metadata for
   # attachments whose stale thumbnails were removed; posts.sql/postmeta.sql
@@ -962,12 +1047,17 @@ restore_site() {
   for f in "$qdir"/rows/posts.sql "$qdir"/rows/postmeta.sql "$qdir"/rows/thumb-postmeta.sql; do
     [[ -s "$f" ]] || continue
     log "  importing $(basename "$f")"
-    wp_run db import "$f" >/dev/null || warn "  cannot import $(basename "$f")"
+    wp_run db import "$f" >/dev/null || { warn "  cannot import $(basename "$f")"; failures=$((failures + 1)); }
   done
 
-  ok "restored $qdir into $SITE_PATH"
-  log "  the quarantine set is left in place: remove it by hand once you are satisfied"
-  return 0
+  if [[ $failures -eq 0 ]]; then
+    ok "restored $qdir into $SITE_PATH"
+    log "  the quarantine set is left in place: remove it by hand once you are satisfied"
+    return 0
+  fi
+
+  warn "  restore of $qdir finished with $failures failure(s): NOT fully restored, keeping the quarantine set -- investigate and re-run the restore"
+  return 1
 }
 
 main() {
