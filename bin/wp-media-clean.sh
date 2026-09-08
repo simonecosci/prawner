@@ -937,11 +937,28 @@ list_quarantine_site() {
 }
 
 # restore_chown_path <rel>
-# Chowns $SITE_PATH/$rel to $SITE_OWNER:$SITE_GROUP, then walks its ancestors
-# up to (but not including) $UPLOADS_DIR, chowning any that are not already
-# owned by $SITE_OWNER:$SITE_GROUP and stopping at the first ancestor that
-# already is -- everything above that point either pre-dates this restore or
-# was already fixed by an earlier manifest entry sharing the same directory.
+# Chowns $SITE_PATH/$rel to $SITE_OWNER:$SITE_GROUP, then walks EVERY ancestor
+# up to (but not including) $UPLOADS_DIR, chowning each one whose ownership is
+# wrong.
+#
+# The walk deliberately does not stop at the first correctly-owned ancestor.
+# It used to, on the theory that everything above a correct directory must
+# already be correct too, and that is false the moment a chown fails: run 1
+# fixes uploads/2024/05 but fails on uploads/2024 and reports the failure
+# ("re-running is safe and will retry it"); run 2 reaches the now-correct
+# uploads/2024/05, breaks there, never revisits the still-root-owned
+# uploads/2024, and reports "ok ... remove it by hand" over a directory the
+# web server still cannot write. An uploads path is two or three levels deep,
+# so walking it out costs two extra stat calls -- against a false "ok" on the
+# one code path an operator reaches only after this tool has already damaged
+# their site.
+#
+# The stop condition is containment, not string equality: the walk continues
+# only while $path is strictly inside $UPLOADS_DIR. Equality alone silently
+# overshoots when basedir carries a trailing slash (reachable through the
+# legacy upload_path option) -- the compare never matches, and the walk runs
+# past uploads into wp-content, stopping only where the ownership happens to
+# match. Both sides are stripped of trailing slashes before the compare.
 #
 # This is the ONLY place restore_site chowns anything. Two earlier rounds
 # each added a second call site instead: one that skipped the leaf file
@@ -960,17 +977,35 @@ list_quarantine_site() {
 # restore_site's locals, reachable here because this is a direct call, not a
 # subshell -- bash's normal dynamic scoping applies.
 restore_chown_path() {
-  local rel="$1" path owner
+  local rel="$1" path owner stop prefix
   path="$SITE_PATH/$rel"
   chown "$SITE_OWNER":"$SITE_GROUP" "$path" 2>>"$LOG_FILE" \
     || { warn "  cannot chown $rel to $SITE_OWNER:$SITE_GROUP"; chown_failed=1; failures=$((failures + 1)); }
 
+  # "${v##*[!/]}" is the trailing run of slashes, so "${v%"${v##*[!/]}"}" is
+  # $v with them removed. dirname never produces a trailing slash, so only
+  # $UPLOADS_DIR really needs it, but normalising the leaf too keeps the two
+  # sides of the comparison built the same way.
+  stop="${UPLOADS_DIR%"${UPLOADS_DIR##*[!/]}"}"
+  # An empty or root $UPLOADS_DIR gives the walk no floor at all, and a walk
+  # with no floor chowns every directory between the file and /. load_site
+  # rejects an uploads directory that is not a real directory, so this cannot
+  # happen in production; if it somehow does, chown the file and stop.
+  [[ -n "$stop" && "$stop" != "/" ]] || return 0
+  prefix="$stop/"
+
+  path="${path%"${path##*[!/]}"}"
   path="$(dirname "$path")"
-  while [[ "$path" != "$UPLOADS_DIR" && "$path" != "/" ]]; do
+  # Strictly inside $UPLOADS_DIR: "$prefix"* matches ancestors below it and
+  # nothing at or above it, so a rel that somehow does not live under uploads
+  # chowns its own file and no directory at all, rather than walking up into
+  # wp-content.
+  while [[ "$path" == "$prefix"* ]]; do
     owner=$(stat -c '%U:%G' "$path" 2>/dev/null)
-    [[ "$owner" == "$SITE_OWNER:$SITE_GROUP" ]] && break
-    chown "$SITE_OWNER":"$SITE_GROUP" "$path" 2>>"$LOG_FILE" \
-      || { warn "  cannot chown $path to $SITE_OWNER:$SITE_GROUP"; chown_failed=1; failures=$((failures + 1)); }
+    if [[ "$owner" != "$SITE_OWNER:$SITE_GROUP" ]]; then
+      chown "$SITE_OWNER":"$SITE_GROUP" "$path" 2>>"$LOG_FILE" \
+        || { warn "  cannot chown $path to $SITE_OWNER:$SITE_GROUP"; chown_failed=1; failures=$((failures + 1)); }
+    fi
     path="$(dirname "$path")"
   done
 }
@@ -1033,6 +1068,20 @@ restore_site() {
     local destdir
     while IFS=$'\t' read -r class rel att || [[ -n "$class$rel$att" ]]; do
       [[ -n "$rel" ]] || { warn "  malformed manifest line (missing path), skipping"; malformed_failed=1; failures=$((failures + 1)); continue; }
+
+      # Already restored (an earlier run, or an earlier pass of this one):
+      # the destination is there and nothing is left in files/ to move.
+      # Tested here rather than left to fall out of a failing `mv`: the
+      # post-move filesystem check below does classify this case correctly,
+      # but only after mv has written "cannot stat ...: No such file or
+      # directory" into the operator's log -- once per entry, on a run that
+      # is otherwise wholly successful, in the one log an operator reads
+      # while deciding whether their recovery worked.
+      if [[ -e "$SITE_PATH/$rel" && ! -e "$qdir/files/$rel" ]]; then
+        restore_chown_path "$rel"
+        continue
+      fi
+
       destdir="$(dirname "$SITE_PATH/$rel")"
       mkdir -p "$destdir"
 
@@ -1044,12 +1093,10 @@ restore_site() {
       # cannot close, and the skip it causes here is invisible to an exit
       # status check. Only the filesystem afterwards can tell a real move
       # from a no-clobber skip: the move only counts if the destination now
-      # exists and the quarantine copy is gone. That same check is also what
-      # makes an already-restored entry fall into the success branch below
-      # for free -- if the destination was already there and the quarantine
-      # copy was already gone before this mv even ran (mv then fails with
-      # "no such file", touching nothing), the desired end state already
-      # holds, and the only thing left to do for that entry is the chown.
+      # exists and the quarantine copy is gone. Keep this check exactly as it
+      # is -- the already-restored short-circuit above narrows what reaches
+      # it, but every move actually attempted here still needs it, because
+      # `mv -n` reports success for the skip it is about to catch.
       mv -n "$qdir/files/$rel" "$SITE_PATH/$rel" 2>>"$LOG_FILE"
       if [[ -e "$SITE_PATH/$rel" && ! -e "$qdir/files/$rel" ]]; then
         restore_chown_path "$rel"

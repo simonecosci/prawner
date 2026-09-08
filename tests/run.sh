@@ -6,6 +6,10 @@
 # These cover the string and set logic only: no WordPress, no database, no
 # filesystem under /var/www. Run with: ./tests/run.sh
 #
+# The restore path cannot be tested this way - it needs real temp trees and
+# stubs for chown, stat and wp_run, and those stubs would leak into every
+# assertion here - so it has its own runner: ./tests/restore.sh. Run both.
+#
 set -uo pipefail
 
 TESTS_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
