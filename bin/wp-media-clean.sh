@@ -409,14 +409,6 @@ EOF
 }
 
 parse_args() {
-  # KEEP_QUARANTINE only ever comes from the environment (no --flag for it),
-  # but it still needs validating before prune_quarantine does arithmetic
-  # with it: a non-numeric value errors out the $(( )) below, and 0 means
-  # "keep nothing", which deletes the quarantine set this very run just
-  # created, seconds after the files landed in it.
-  [[ "$KEEP_QUARANTINE" =~ ^[0-9]+$ && "$KEEP_QUARANTINE" -ge 1 ]] \
-    || die "KEEP_QUARANTINE must be an integer >= 1 (got: $KEEP_QUARANTINE)"
-
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --site)            ONLY_SITE="${2:-}"; [[ -n "$ONLY_SITE" ]] || die "--site requires a value"; shift 2 ;;
@@ -441,6 +433,16 @@ parse_args() {
   if [[ "$ACTION" == "restore" && -z "$ONLY_SITE" ]]; then
     die "--restore also requires --site: a stamp is only unique within one site"
   fi
+
+  # KEEP_QUARANTINE only ever comes from the environment (no --flag for it),
+  # but it still needs validating before prune_quarantine does arithmetic
+  # with it: a non-numeric value errors out the $(( )) below, and 0 means
+  # "keep nothing", which deletes the quarantine set this very run just
+  # created, seconds after the files landed in it. Checked after the loop, not
+  # before it, so --help (which exits inside the loop) still works with a bad
+  # KEEP_QUARANTINE in the environment instead of dying on it first.
+  [[ "$KEEP_QUARANTINE" =~ ^[0-9]+$ && "$KEEP_QUARANTINE" -ge 1 ]] \
+    || die "KEEP_QUARANTINE must be an integer >= 1 (got: $KEEP_QUARANTINE)"
 }
 
 # -------------------------------------------------------------- classify
@@ -737,7 +739,7 @@ quarantine_site() {
   mkdir -p "$QDIR/files" "$QDIR/rows"
   : > "$QDIR/manifest.tsv"
 
-  local ids id rel dir fname f sname move_ok
+  local ids id rel dir fname f sname move_ok n_att_done
   local has_rows_posts has_rows_postmeta footer_posts footer_postmeta dump_ok
   local thumb_ids thumb_dir
 
@@ -785,6 +787,7 @@ quarantine_site() {
     fi
 
     if [[ $dump_ok -eq 1 ]]; then
+      n_att_done=0
       while IFS=$'\t' read -r id rel; do
         dir=$(dirname "$rel")
         move_ok=1
@@ -799,13 +802,19 @@ quarantine_site() {
         # the only record of it; deleting the post here would leave
         # wp_delete_attachment nothing to unlink and no way back for it.
         if [[ $move_ok -eq 1 ]]; then
-          wp_run post delete "$id" --force </dev/null >/dev/null 2>&1 \
-            || warn "  wp post delete $id failed, the row is still there"
+          if wp_run post delete "$id" --force </dev/null >/dev/null 2>&1; then
+            n_att_done=$((n_att_done + 1))
+          else
+            warn "  wp post delete $id failed, the row is still there"
+          fi
         else
           warn "  not every file for attachment $id moved, leaving the row in place"
         fi
       done < "$WORK/doomed-attachments.tsv"
-      log "  quarantined $(wc -l < "$WORK/doomed-attachments.tsv") attachments"
+      # The count of lines in doomed-attachments.tsv is what was ELIGIBLE, not
+      # what happened: a run whose log overstates what it did (every delete
+      # skipped because move_ok was 0, say) is worse than a quiet one.
+      log "  quarantined $n_att_done attachments"
     fi
   fi
 
@@ -842,36 +851,48 @@ quarantine_site() {
       # Capture the pre-edit metadata row too: unset() below only removes a
       # size name from the array, it does not tell us the file/width/height
       # that size once had, so without this dump the metadata edit is the one
-      # mutation in the whole program that would not round-trip.
+      # mutation in the whole program that would not round-trip. By the time
+      # this eval runs the thumbnail files are already off the site, so this
+      # is not a step alongside a reversible move, it is the step that makes
+      # the move irreversible: gate it on the dump the same way Critical 3
+      # gates the attachment removal, on an actual INSERT INTO rather than
+      # -s, since a dump can die right after its header and still be non-empty.
       thumb_ids=$(cut -f1 "$WORK/thumb-sizes.tsv" | sort -u | paste -sd, -)
       wp_run db export - --tables="${PREFIX}postmeta" \
         --where="post_id IN ($thumb_ids) AND meta_key='_wp_attachment_metadata'" \
         --no-create-info --skip-add-drop-table > "$QDIR/rows/thumb-postmeta.sql"
-      [[ -s "$QDIR/rows/thumb-postmeta.sql" ]] \
-        || warn "  cannot dump the pre-edit attachment metadata, restoring thumbnail sizes may be incomplete"
 
-      wp_run eval "
-        \$rows = array_filter( explode( \"\n\", file_get_contents( '$QDIR/rows/thumb-sizes.tsv' ) ) );
-        \$by_id = array();
-        foreach ( \$rows as \$r ) {
-          list( \$id, \$size ) = explode( \"\t\", \$r );
-          \$by_id[ (int) \$id ][] = \$size;
-        }
-        foreach ( \$by_id as \$id => \$sizes ) {
-          \$m = wp_get_attachment_metadata( \$id );
-          if ( ! is_array( \$m ) || empty( \$m['sizes'] ) ) { continue; }
-          foreach ( \$sizes as \$s ) { unset( \$m['sizes'][ \$s ] ); }
-          wp_update_attachment_metadata( \$id, \$m );
-        }
-      " >/dev/null 2>&1 || warn "  cannot clean the thumbnail metadata, srcset may 404"
+      if grep -q '^INSERT INTO' "$QDIR/rows/thumb-postmeta.sql" 2>/dev/null; then
+        wp_run eval "
+          \$rows = array_filter( explode( \"\n\", file_get_contents( '$QDIR/rows/thumb-sizes.tsv' ) ) );
+          \$by_id = array();
+          foreach ( \$rows as \$r ) {
+            list( \$id, \$size ) = explode( \"\t\", \$r );
+            \$by_id[ (int) \$id ][] = \$size;
+          }
+          foreach ( \$by_id as \$id => \$sizes ) {
+            \$m = wp_get_attachment_metadata( \$id );
+            if ( ! is_array( \$m ) || empty( \$m['sizes'] ) ) { continue; }
+            foreach ( \$sizes as \$s ) { unset( \$m['sizes'][ \$s ] ); }
+            wp_update_attachment_metadata( \$id, \$m );
+          }
+        " >/dev/null 2>&1 || warn "  cannot clean the thumbnail metadata, srcset may 404"
+      else
+        warn "  cannot dump the pre-edit attachment metadata, leaving it untouched: stale srcset entries will 404 but stay reversible"
+      fi
     fi
   fi
 
   if [[ ! -s "$QDIR/manifest.tsv" ]]; then
-    # Plain rmdir, never rm -rf: it refuses on a non-empty directory, so if a
-    # row dump is sitting in rows/ (every qmove for a doomed attachment failed,
+    # manifest.tsv itself was created empty at the top of this function, so
+    # it is always present here and would block a plain rmdir "$QDIR" on its
+    # own; it is provably empty in this branch (that's the branch condition),
+    # so removing it first is always safe. Everything else stays a plain
+    # rmdir, never rm -rf: it refuses on a non-empty directory, so if a row
+    # dump is sitting in rows/ (every qmove for a doomed attachment failed,
     # say, with the dumps already on disk) the teardown simply does not
     # happen, instead of taking the only copy of those rows down with it.
+    rm -f "$QDIR/manifest.tsv"
     rmdir "$QDIR/files" "$QDIR/rows" "$QDIR" 2>/dev/null
     log "  nothing to quarantine"
     return 0
