@@ -673,8 +673,128 @@ clean_site() {
   quarantine_site
 }
 
-# Temporary stub; Task 7 replaces this with the real quarantine move.
-quarantine_site() { warn "  --apply not implemented yet"; return 0; }
+# ------------------------------------------------------------ quarantine
+
+# Moves one file into the quarantine, keeping its path relative to the docroot
+# so that --restore is a plain move back.
+qmove() {
+  local src="$1" class="$2" att="$3" rel dest
+  rel="${src#"$SITE_PATH"/}"
+  dest="$QDIR/files/$rel"
+  mkdir -p "$(dirname "$dest")"
+  # mv -n exits 0 even when it silently skips an existing destination (GNU
+  # coreutils), so the exit status alone cannot tell a real move from a
+  # no-clobber skip. Check the filesystem instead: the move only actually
+  # happened if the source is gone and the destination is there.
+  mv -n "$src" "$dest" 2>>"$LOG_FILE"
+  if [[ -e "$dest" && ! -e "$src" ]]; then
+    printf '%s\t%s\t%s\n' "$class" "$rel" "$att" >> "$QDIR/manifest.tsv"
+    return 0
+  fi
+  warn "  cannot move $src"
+  return 1
+}
+
+prune_quarantine() {
+  local site_dir="$QUARANTINE_ROOT/$SITE_SLUG" old
+  [[ -d "$site_dir" ]] || return 0
+  ls -1dt "$site_dir"/*/ 2>/dev/null | tail -n +$((KEEP_QUARANTINE + 1)) | while read -r old; do
+    log "  pruning old quarantine set: $old"
+    rm -rf "$old"
+  done
+}
+
+quarantine_site() {
+  QDIR="$QUARANTINE_ROOT/$SITE_SLUG/$STAMP"
+  mkdir -p "$QDIR/files" "$QDIR/rows"
+  : > "$QDIR/manifest.tsv"
+
+  local ids id rel dir fname f sname
+
+  # --- attachments. Order matters: dump the rows, then move the files, then
+  # let WordPress delete the post. Deleting first would take the files with it;
+  # moving first leaves wp_delete_attachment nothing to unlink, and it still
+  # cleans up postmeta and the term relationships correctly.
+  if [[ -s "$WORK/doomed-attachments.tsv" ]]; then
+    ids=$(cut -f1 "$WORK/doomed-attachments.tsv" | paste -sd, -)
+
+    wp_run db export - --tables="${PREFIX}posts" --where="ID IN ($ids)" \
+      --no-create-info --skip-add-drop-table > "$QDIR/rows/posts.sql"
+    wp_run db export - --tables="${PREFIX}postmeta" --where="post_id IN ($ids)" \
+      --no-create-info --skip-add-drop-table > "$QDIR/rows/postmeta.sql"
+
+    # The exit status of wp_run is not the test here: a dump that fails partway
+    # can still exit 0 and leave a truncated file. Non-empty is what matters,
+    # and without both dumps the removal must not happen at all.
+    if [[ ! -s "$QDIR/rows/posts.sql" || ! -s "$QDIR/rows/postmeta.sql" ]]; then
+      warn "  the row dump failed or is empty: attachments left untouched"
+    else
+      while IFS=$'\t' read -r id rel; do
+        dir=$(dirname "$rel")
+        qmove "$UPLOADS_DIR/$rel" attachment "$id"
+        # every generated size of this attachment
+        awk -F'\t' -v i="$id" '$1 == i { print $3 }' "$WORK/sizemap.tsv" \
+          | while IFS= read -r fname; do
+              [[ -f "$UPLOADS_DIR/$dir/$fname" ]] && qmove "$UPLOADS_DIR/$dir/$fname" attachment "$id"
+            done
+        wp_run post delete "$id" --force >/dev/null 2>&1 \
+          || warn "  wp post delete $id failed, the row is still there"
+      done < "$WORK/doomed-attachments.tsv"
+      log "  quarantined $(wc -l < "$WORK/doomed-attachments.tsv") attachments"
+    fi
+  fi
+
+  # --- orphan files: a move, nothing else. WordPress does not know them.
+  if [[ -s "$WORK/doomed-orphans.txt" ]]; then
+    while IFS= read -r f; do qmove "$f" orphan -; done < "$WORK/doomed-orphans.txt"
+    log "  quarantined $(wc -l < "$WORK/doomed-orphans.txt") orphan files"
+  fi
+
+  # --- stale thumbnails: move, then drop the size from the metadata. Leaving
+  # the entry in place would keep WordPress emitting the URL in srcset and turn
+  # every removed thumbnail into a 404.
+  if [[ -s "$WORK/doomed-thumbs.txt" ]]; then
+    : > "$WORK/thumb-sizes.tsv"
+    while IFS= read -r f; do
+      fname=$(basename "$f")
+      id=$(awk -F'\t' -v n="$fname" '$3 == n { print $1; exit }' "$WORK/sizemap.tsv")
+      sname=$(awk -F'\t' -v n="$fname" '$3 == n { print $2; exit }' "$WORK/sizemap.tsv")
+      qmove "$f" thumb "${id:--}" || continue
+      [[ -n "$id" && -n "$sname" ]] && printf '%s\t%s\n' "$id" "$sname" >> "$WORK/thumb-sizes.tsv"
+    done < "$WORK/doomed-thumbs.txt"
+    log "  quarantined $(wc -l < "$WORK/doomed-thumbs.txt") stale thumbnails"
+
+    if [[ -s "$WORK/thumb-sizes.tsv" ]]; then
+      cp "$WORK/thumb-sizes.tsv" "$QDIR/rows/thumb-sizes.tsv"
+      wp_run eval "
+        \$rows = array_filter( explode( \"\n\", file_get_contents( '$QDIR/rows/thumb-sizes.tsv' ) ) );
+        \$by_id = array();
+        foreach ( \$rows as \$r ) {
+          list( \$id, \$size ) = explode( \"\t\", \$r );
+          \$by_id[ (int) \$id ][] = \$size;
+        }
+        foreach ( \$by_id as \$id => \$sizes ) {
+          \$m = wp_get_attachment_metadata( \$id );
+          if ( ! is_array( \$m ) || empty( \$m['sizes'] ) ) { continue; }
+          foreach ( \$sizes as \$s ) { unset( \$m['sizes'][ \$s ] ); }
+          wp_update_attachment_metadata( \$id, \$m );
+        }
+      " >/dev/null 2>&1 || warn "  cannot clean the thumbnail metadata, srcset may 404"
+    fi
+  fi
+
+  if [[ ! -s "$QDIR/manifest.tsv" ]]; then
+    rmdir -p "$QDIR/files" "$QDIR/rows" 2>/dev/null
+    rm -rf "$QDIR"
+    log "  nothing to quarantine"
+    return 0
+  fi
+
+  cp "$LOG_FILE" "$QDIR/report.txt" 2>/dev/null
+  ok "quarantine: $QDIR ($(wc -l < "$QDIR/manifest.tsv") items)"
+  prune_quarantine
+  return 0
+}
 
 main() {
   parse_args "$@"
