@@ -197,8 +197,16 @@ producing 404s. That value is serialized PHP, which bash handles badly, so the
 script uses a short inline `wp eval` (no additional file to install) to unset
 the removed sizes from the array.
 
-On restore the metadata is rebuilt with `wp media regenerate --only-missing`
-for the affected attachments.
+On restore the metadata is **not** rebuilt with `wp media regenerate
+--only-missing`, as an earlier draft of this section specified. The quarantine
+set captures the pre-edit `_wp_attachment_metadata` row itself, in
+`rows/thumb-postmeta.sql`, and importing it restores the array exactly as it
+was — including the entries for sizes the theme no longer registers, which are
+precisely the ones the removal was about. `wp media regenerate` would then
+rewrite that metadata down to the currently registered sizes and undo the
+restore it was supposed to complete. The implementation deliberately does not
+call it, and `tests/restore.sh` asserts that it never does; do not "fix" this
+back.
 
 ### Quarantine layout
 
@@ -228,8 +236,9 @@ this one is not.
 ### Restore
 
 `--restore <stamp> --site <domain>` moves the files back to their original
-locations, applies `chown` to the site's owner and group, imports
-`rows/*.sql`, and regenerates the metadata of the affected attachments. It
+locations, applies `chown` to the site's owner and group, and imports
+`rows/*.sql` — which is what puts the attachment metadata back, exactly as it
+was. It does not regenerate anything (see "Thumbnail metadata" above). It
 refuses to run if a destination file already exists, reporting the conflict
 rather than overwriting.
 
