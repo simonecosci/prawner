@@ -936,6 +936,45 @@ list_quarantine_site() {
   done
 }
 
+# restore_chown_path <rel>
+# Chowns $SITE_PATH/$rel to $SITE_OWNER:$SITE_GROUP, then walks its ancestors
+# up to (but not including) $UPLOADS_DIR, chowning any that are not already
+# owned by $SITE_OWNER:$SITE_GROUP and stopping at the first ancestor that
+# already is -- everything above that point either pre-dates this restore or
+# was already fixed by an earlier manifest entry sharing the same directory.
+#
+# This is the ONLY place restore_site chowns anything. Two earlier rounds
+# each added a second call site instead: one that skipped the leaf file
+# entirely on a "nothing to move" shortcut, and its fix in turn skipped the
+# ancestor directories whenever the entry that would have created them was
+# the one whose move failed. Both drifted from the "real" chown in a
+# different way because there were two of them. A single routine, called
+# unconditionally for every manifest entry that ends up correctly placed --
+# whether the move happened just now, in an earlier run, or turns out to
+# have needed no move at all because the file was already there -- cannot
+# drift, because there is only one of it, and it decides what to chown from
+# current ownership on disk rather than from bookkeeping about what this
+# particular call created.
+#
+# Sets $chown_failed and adds to $failures on any failure; both are
+# restore_site's locals, reachable here because this is a direct call, not a
+# subshell -- bash's normal dynamic scoping applies.
+restore_chown_path() {
+  local rel="$1" path owner
+  path="$SITE_PATH/$rel"
+  chown "$SITE_OWNER":"$SITE_GROUP" "$path" 2>>"$LOG_FILE" \
+    || { warn "  cannot chown $rel to $SITE_OWNER:$SITE_GROUP"; chown_failed=1; failures=$((failures + 1)); }
+
+  path="$(dirname "$path")"
+  while [[ "$path" != "$UPLOADS_DIR" && "$path" != "/" ]]; do
+    owner=$(stat -c '%U:%G' "$path" 2>/dev/null)
+    [[ "$owner" == "$SITE_OWNER:$SITE_GROUP" ]] && break
+    chown "$SITE_OWNER":"$SITE_GROUP" "$path" 2>>"$LOG_FILE" \
+      || { warn "  cannot chown $path to $SITE_OWNER:$SITE_GROUP"; chown_failed=1; failures=$((failures + 1)); }
+    path="$(dirname "$path")"
+  done
+}
+
 restore_site() {
   local qdir="$QUARANTINE_ROOT/$SITE_SLUG/$RESTORE_STAMP"
   [[ -d "$qdir" ]] || { warn "  no quarantine set $RESTORE_STAMP for this site"; return 1; }
@@ -946,14 +985,15 @@ restore_site() {
   # "ok" and tell the operator the quarantine set is now disposable -- a bare
   # warn() on its own changes nothing about the return value, so without this
   # counter every one of those problems could still end in a false "restored"
-  # report. move_failed/chown_failed/import_failed record which *kind* of
-  # problem occurred, so the closing message can tell the operator something
-  # more useful than "investigate": a chown or import failure is always safe
-  # to fix by re-running (the "already restored" branch below retries both),
-  # but a move failure is not -- re-running while a file is genuinely missing
-  # from quarantine can misreport the files that DID move as conflicts.
+  # report. malformed_failed/move_failed/chown_failed/import_failed record
+  # which *kind* of problem occurred, each set only where that exact kind of
+  # attempt was actually made, so the closing message can tell the operator
+  # something more useful than "investigate": a chown or import failure is
+  # always safe to fix by re-running, a malformed manifest line never is
+  # (no amount of re-running invents a path that was never recorded), and a
+  # move failure means investigate the quarantined file itself.
   local class rel att conflicts=0 failures=0
-  local move_failed=0 chown_failed=0 import_failed=0
+  local malformed_failed=0 move_failed=0 chown_failed=0 import_failed=0
 
   # A missing or empty manifest is not an error: quarantine_site's own
   # teardown removes an empty manifest.tsv while leaving a populated rows/
@@ -961,116 +1001,73 @@ restore_site() {
   # that combination is reachable and legitimate. It just means there is
   # nothing to move back; the row import below still runs.
   if [[ -s "$qdir/manifest.tsv" ]]; then
-    # A restore run a second time, after a first run already moved every
-    # file back, is not a conflict: if every destination in the manifest is
-    # already in place AND quarantine's files/ holds nothing left to move,
-    # that is the unambiguous signature of "the file phase already
-    # happened" (this same restore run again, or an earlier attempt that got
-    # the files across but failed before the row import). Recognise that
-    # case and go straight to the row import instead of reporting every line
-    # as a conflict and refusing outright -- otherwise a restore that fails
-    # only on the database step can never be completed by re-running it,
-    # which is exactly the recovery path this function exists to offer.
-    local all_present=1
+    # Refuse rather than overwrite -- but only for a GENUINE conflict: the
+    # destination exists AND the quarantined copy is still sitting in
+    # files/. A destination that exists with no quarantined copy left behind
+    # is not a conflict, it is an entry an earlier run (or an earlier pass
+    # of this same run) already restored; per-entry, this is what lets a
+    # partially-restored set finish on a second attempt instead of aborting
+    # on conflicts that were never real, which is the whole reason a
+    # dedicated "already restored" shortcut used to exist here. Removing
+    # that shortcut and checking each entry directly costs nothing (the same
+    # data, $qdir/files/$rel, was already available) and cannot drift the
+    # way the shortcut itself did, twice, across the last two rounds.
+    #
     # `read` returns non-zero on a final line with no trailing newline, and a
     # plain `while read ...; do ... done < file` treats that as end of input
     # and never runs the loop body for it at all -- not even far enough to
     # reach the "$rel is empty" guard below. The `|| [[ -n "$class$rel$att" ]]`
     # keeps a non-empty last line in the loop exactly once, so a truncated
     # manifest still gets a chance to be flagged as malformed instead of
-    # silently vanishing before that check even runs. This same idiom repeats
-    # on every manifest.tsv read below.
+    # silently vanishing before that check even runs. This same idiom
+    # repeats on the second manifest.tsv read below.
     while IFS=$'\t' read -r class rel att || [[ -n "$class$rel$att" ]]; do
-      [[ -n "$rel" ]] || { warn "  malformed manifest line (missing path), skipping"; move_failed=1; failures=$((failures + 1)); continue; }
-      [[ -e "$SITE_PATH/$rel" ]] || { all_present=0; break; }
+      [[ -n "$rel" ]] || { warn "  malformed manifest line (missing path), skipping"; malformed_failed=1; failures=$((failures + 1)); continue; }
+      if [[ -e "$SITE_PATH/$rel" && -e "$qdir/files/$rel" ]]; then
+        warn "  conflict, already present: $rel"
+        conflicts=$((conflicts + 1))
+      fi
     done < "$qdir/manifest.tsv"
+    [[ $conflicts -eq 0 ]] || { warn "  $conflicts conflicts, restore aborted"; return 1; }
 
-    local files_left
-    files_left=$(find "$qdir/files" -type f -print -quit 2>/dev/null)
+    local destdir
+    while IFS=$'\t' read -r class rel att || [[ -n "$class$rel$att" ]]; do
+      [[ -n "$rel" ]] || { warn "  malformed manifest line (missing path), skipping"; malformed_failed=1; failures=$((failures + 1)); continue; }
+      destdir="$(dirname "$SITE_PATH/$rel")"
+      mkdir -p "$destdir"
 
-    if [[ $all_present -eq 1 && -z "$files_left" ]]; then
-      log "  every file is already at its destination and quarantine/files is empty: already restored, re-applying ownership and importing the rows only"
-      # The chown is not optional here: a first run that got every file back
-      # in place but then failed on chown (or on the row import, which can
-      # only be reached after a successful chown attempt) must not let a
-      # second run skip ownership just because there is nothing left to
-      # move. Skipping it is exactly how Important 1's fix got reintroduced
-      # through Important 2's shortcut: an operator who trusts this run's
-      # "ok" would be left with a site that still cannot read its own
-      # images. Re-chowning an already-correct file is a no-op, so there is
-      # no cost to doing it unconditionally on every resumed run.
-      while IFS=$'\t' read -r class rel att || [[ -n "$class$rel$att" ]]; do
-        [[ -n "$rel" ]] || { warn "  malformed manifest line (missing path), skipping"; move_failed=1; failures=$((failures + 1)); continue; }
-        chown "$SITE_OWNER":"$SITE_GROUP" "$SITE_PATH/$rel" 2>>"$LOG_FILE" \
-          || { warn "  cannot chown $rel to $SITE_OWNER:$SITE_GROUP"; chown_failed=1; failures=$((failures + 1)); }
-      done < "$qdir/manifest.tsv"
-    else
-      # Refuse rather than overwrite: a destination that already exists means
-      # something was re-uploaded since, and clobbering it would be a second
-      # data loss on top of whatever made the restore necessary. Check every
-      # conflict before moving anything, so a partial restore never happens.
-      while IFS=$'\t' read -r class rel att || [[ -n "$class$rel$att" ]]; do
-        [[ -n "$rel" ]] || { warn "  malformed manifest line (missing path), skipping"; move_failed=1; failures=$((failures + 1)); continue; }
-        [[ -e "$SITE_PATH/$rel" ]] && { warn "  conflict, already present: $rel"; conflicts=$((conflicts + 1)); }
-      done < "$qdir/manifest.tsv"
-      [[ $conflicts -eq 0 ]] || { warn "  $conflicts conflicts, restore aborted"; return 1; }
-
-      local destdir new_dirs probe d
-      while IFS=$'\t' read -r class rel att || [[ -n "$class$rel$att" ]]; do
-        [[ -n "$rel" ]] || { warn "  malformed manifest line (missing path), skipping"; move_failed=1; failures=$((failures + 1)); continue; }
-        destdir="$(dirname "$SITE_PATH/$rel")"
-
-        # Every ancestor directory mkdir -p is about to create needs the same
-        # ownership fix as the file itself: restoring uploads/2024/05/f.jpg
-        # into a site with no uploads/2024/ yet must not leave that freshly
-        # created uploads/2024/ (or uploads/2024/05/) root-owned just because
-        # only the leaf file got chowned.
-        new_dirs=()
-        probe="$destdir"
-        while [[ ! -d "$probe" ]]; do
-          new_dirs+=("$probe")
-          probe="$(dirname "$probe")"
-        done
-        mkdir -p "$destdir"
-
-        # mv -n exits 0 even when it silently skips an existing destination
-        # (GNU coreutils) -- the same trap qmove guards against, twenty lines
-        # earlier in this file, when moving files INTO quarantine. A
-        # destination created between the conflict scan above and this move
-        # (a concurrent upload on a live site) is exactly the race that scan
-        # cannot close, and the skip it causes here is invisible to an exit
-        # status check. Only the filesystem afterwards can tell a real move
-        # from a no-clobber skip: the move only actually happened if the
-        # destination now exists and the quarantine copy is gone.
-        mv -n "$qdir/files/$rel" "$SITE_PATH/$rel" 2>>"$LOG_FILE"
-        if [[ -e "$SITE_PATH/$rel" && ! -e "$qdir/files/$rel" ]]; then
-          # Chown exactly what this restore touched, from the manifest's own
-          # path, rather than a guessed "$SITE_PATH/wp-content/uploads": a
-          # custom WP_CONTENT_DIR/UPLOADS constant or a legacy upload_path
-          # makes that guess wrong, chown fails on it, and 2>/dev/null used
-          # to swallow that silently, leaving the restored files root-owned.
-          for d in "${new_dirs[@]}"; do
-            chown "$SITE_OWNER":"$SITE_GROUP" "$d" 2>>"$LOG_FILE" \
-              || { warn "  cannot chown $d to $SITE_OWNER:$SITE_GROUP"; chown_failed=1; failures=$((failures + 1)); }
-          done
-          chown "$SITE_OWNER":"$SITE_GROUP" "$SITE_PATH/$rel" 2>>"$LOG_FILE" \
-            || { warn "  cannot chown $rel to $SITE_OWNER:$SITE_GROUP"; chown_failed=1; failures=$((failures + 1)); }
-        else
-          warn "  cannot restore $rel"
-          move_failed=1
-          failures=$((failures + 1))
-        fi
-      done < "$qdir/manifest.tsv"
-    fi
+      # mv -n exits 0 even when it silently skips an existing destination
+      # (GNU coreutils) -- the same trap qmove guards against, twenty lines
+      # earlier in this file, when moving files INTO quarantine. A
+      # destination created between the conflict scan above and this move
+      # (a concurrent upload on a live site) is exactly the race that scan
+      # cannot close, and the skip it causes here is invisible to an exit
+      # status check. Only the filesystem afterwards can tell a real move
+      # from a no-clobber skip: the move only counts if the destination now
+      # exists and the quarantine copy is gone. That same check is also what
+      # makes an already-restored entry fall into the success branch below
+      # for free -- if the destination was already there and the quarantine
+      # copy was already gone before this mv even ran (mv then fails with
+      # "no such file", touching nothing), the desired end state already
+      # holds, and the only thing left to do for that entry is the chown.
+      mv -n "$qdir/files/$rel" "$SITE_PATH/$rel" 2>>"$LOG_FILE"
+      if [[ -e "$SITE_PATH/$rel" && ! -e "$qdir/files/$rel" ]]; then
+        restore_chown_path "$rel"
+      else
+        warn "  cannot restore $rel"
+        move_failed=1
+        failures=$((failures + 1))
+      fi
+    done < "$qdir/manifest.tsv"
   else
     log "  no manifest (or it is empty): nothing to move back, importing rows only"
   fi
 
   # Files first, then rows: a real failure between the two still leaves files
   # present and rows absent, and that is recoverable by re-running the
-  # restore -- the "already restored" check above is exactly what makes the
-  # second run reach the row import instead of refusing on the conflicts it
-  # would otherwise see for every file now sitting at its destination.
+  # restore -- every entry that already made it across is recognised as such
+  # per-entry above, so a second run reaches the row import instead of
+  # refusing on conflicts that are not conflicts.
   #
   # thumb-postmeta.sql carries the pre-edit _wp_attachment_metadata for
   # attachments whose stale thumbnails were removed; posts.sql/postmeta.sql
@@ -1092,16 +1089,12 @@ restore_site() {
     return 0
   fi
 
-  # A re-run is not universally the right advice: it is safe (and expected)
-  # for a chown or import failure, since the "already restored" branch above
-  # retries both unconditionally, but it is not safe for a move failure -- a
-  # manifest entry whose source is genuinely gone from quarantine will never
-  # move, and re-running while it is still listed can make the conflict scan
-  # misreport the files that DID move as conflicts instead of retrying the
-  # one that did not.
   local advice=""
+  if [[ $malformed_failed -eq 1 ]]; then
+    advice+="the manifest has malformed entries with no recorded path -- those cannot be restored automatically and re-running will not fix them; inspect $qdir/manifest.tsv by hand. "
+  fi
   if [[ $move_failed -eq 1 ]]; then
-    advice+="some files could not be moved back -- investigate $qdir/files before re-running; a plain re-run may misreport files that DID move as conflicts instead of retrying the ones that did not. "
+    advice+="some files could not be moved back, likely because the quarantined copy under $qdir/files is missing or unreadable -- investigate before re-running; a re-run will safely retry only the entries that failed. "
   fi
   if [[ $chown_failed -eq 1 ]]; then
     advice+="ownership could not be set on some restored files -- re-running is safe and will retry it. "
