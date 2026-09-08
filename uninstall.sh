@@ -25,7 +25,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-for name in wp-site.sh wp-update.sh; do
+for name in wp-site.sh wp-update.sh wp-media-clean.sh; do
   DEST="$PREFIX/$name"
   if [[ -f "$DEST" ]]; then
     rm -f "$DEST"
