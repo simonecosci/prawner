@@ -61,6 +61,11 @@ The tool assumes a VPS that is already set up with:
 - [`certbot`](https://certbot.eff.org/) with the nginx plugin
   (`apt install certbot python3-certbot-nginx`)
 - `openssl`, `curl`, `getent`, the basic coreutils tools
+- `wp-media-clean.sh` additionally requires `comm`, `find` and `stat` (it
+  refuses to run without any of them, alongside `wp`, `mysql`, `grep`, `sed`,
+  `awk`, `sort` and `sudo` already covered above); `numfmt` is used for
+  human-readable byte totals in its report but is optional — without it the
+  report prints raw byte counts instead
 
 The domain DNS must already point to the public IP of the VPS before running
 `create` or `cert`: both commands check the resolution and warn (or stop) if
@@ -216,9 +221,29 @@ This tool was built and reviewed without a WordPress installation, MySQL,
 wp-cli, `sudo` or `/var/www` to test against: every check below could only be
 verified with unit tests over pure string logic and hand-built fixtures that
 stub `wp_run`, `chown` and `stat`, never against a real site. None of it is a
-substitute for looking at real data. Work through this checklist on a real VPS
-— a test site, not production — before trusting `--apply` with data you care
-about.
+substitute for looking at real data.
+
+Two automated suites cover what could be tested without a real site, and you
+can run both right now, with no WordPress needed:
+
+- `tests/run.sh` — 30 assertions over the pure string helpers (filename
+  parsing, upload variants, URL encoding, reference-token extraction). No
+  WordPress, no database.
+- `tests/restore.sh` — 102 assertions over `restore_site`, against temporary
+  fixture trees with `chown`, `stat` and `wp_run` stubbed. Also no WordPress
+  or database.
+
+Both are standalone:
+
+```bash
+bash tests/run.sh
+bash tests/restore.sh
+```
+
+Everything below is what those two suites cannot cover — real wp-cli output,
+real classification decisions on real data, real files. Work through this
+checklist on a real VPS — a test site, not production — before trusting
+`--apply` with data you care about.
 
 **wp-cli assumptions the collectors depend on:**
 
