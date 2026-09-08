@@ -45,12 +45,26 @@ SCAN_FILES=1
 STAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE=""
 
+# Set by the collectors, read by classify(). Both default to "the collector
+# succeeded" so that sourcing this file (the test suites do) and calling
+# classify() with a hand-built $WORK never trips over an unset variable.
+SIZEMAP_COMPLETE=1      # 0 when collect_size_map's output was cut short
+IDS_OK=1                # 0 when one of collect_id_set's queries failed
+
+# Out-parameters. The classify() file loop runs once per file on disk, so the
+# helpers below publish their result in a global as well as printing it: a
+# caller inside that loop reads the global and pays no fork, while tests/run.sh
+# and every other caller keep using $(...) as before.
+URLENC=""               # urlencode_name
+CANON=""                # canonical_original
+THUMB_BASE=""; THUMB_SIZE=""; THUMB_EXT=""   # parse_thumb_size
+RELDIR=""               # rel_dir
+
 c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
 
 die()  { printf '%s[ERROR]%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
 warn() { printf '%s[!]%s %s\n' "$c_yel" "$c_off" "$*" >&2; [[ -n "$LOG_FILE" ]] && printf '[!] %s\n' "$*" >>"$LOG_FILE"; return 0; }
 ok()   { printf '%s[ok]%s %s\n' "$c_grn" "$c_off" "$*"; }
-info() { printf '  %s\n' "$*"; }
 log()  { printf '%s\n' "$*"; [[ -n "$LOG_FILE" ]] && printf '%s  %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE"; return 0; }
 
 # ------------------------------------------------------- filename helpers
@@ -62,10 +76,13 @@ log()  { printf '%s\n' "$*"; [[ -n "$LOG_FILE" ]] && printf '%s  %s\n' "$(date '
 # prints "<base>|<WxH>|<ext>". Returns 1 for anything else. The size has to sit
 # at the very end of the name: "photo-800x600-detail.jpg" is a user filename
 # that happens to contain digits, not a generated size.
+# Also publishes $THUMB_BASE / $THUMB_SIZE / $THUMB_EXT, so the file loop can
+# call it as `parse_thumb_size "$f" >/dev/null` instead of paying a subshell.
 parse_thumb_size() {
   local name="$1"
   [[ "$name" =~ ^(.+)-([0-9]+x[0-9]+)\.([A-Za-z0-9]+)$ ]] || return 1
-  printf '%s|%s|%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+  THUMB_BASE="${BASH_REMATCH[1]}"; THUMB_SIZE="${BASH_REMATCH[2]}"; THUMB_EXT="${BASH_REMATCH[3]}"
+  printf '%s|%s|%s\n' "$THUMB_BASE" "$THUMB_SIZE" "$THUMB_EXT"
 }
 
 # canonical_original <filename>
@@ -75,13 +92,28 @@ parse_thumb_size() {
 # "<name>-rotated.<ext>". Strips such a suffix so the caller can check whether
 # the file belongs to a known upload. The six digit floor on the -e form keeps
 # ordinary filenames such as "phone-e5.jpg" intact.
+# Also publishes $CANON, for the same fork-free reason as parse_thumb_size.
 canonical_original() {
   local name="$1"
   if [[ "$name" =~ ^(.+)-(scaled|rotated|e[0-9]{6,})\.([A-Za-z0-9]+)$ ]]; then
-    printf '%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}"
+    CANON="${BASH_REMATCH[1]}.${BASH_REMATCH[3]}"
   else
-    printf '%s\n' "$name"
+    CANON="$name"
   fi
+  printf '%s\n' "$CANON"
+}
+
+# rel_dir <path>
+# The directory component of a path, normalised so that a path with no
+# directory component gives "" rather than dirname's ".". Three places used to
+# build this by hand (classify's doomed-attachment-files.txt, report()'s
+# byte accounting and quarantine_site's thumbnail attribution) and only two of
+# them normalised the ".", which put a "./" into the manifest for a root-level
+# upload. Publishes $RELDIR as well as printing, and forks nothing.
+rel_dir() {
+  local p="$1"
+  if [[ "$p" == */* ]]; then RELDIR="${p%/*}"; else RELDIR=""; fi
+  printf '%s\n' "$RELDIR"
 }
 
 # urlencode_name <filename>
@@ -98,6 +130,7 @@ urlencode_name() {
       *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
     esac
   done
+  URLENC="$out"
   printf '%s\n' "$out"
 }
 
@@ -137,8 +170,23 @@ expand_id_list() {
 # so a reference written as "my%20holiday.jpg" lands there in encoded form
 # while the upload on disk is named "my holiday.jpg". Checking only the plain
 # name would report that file as unused.
+#
+# classify() loads used-names.txt into $USED_NAMES_MAP once and sets
+# $USED_NAMES_LOADED; the lookup is then a hash hit rather than a grep that
+# rescans the whole file, and the encoded spelling costs no subshell either
+# (urlencode_name publishes $URLENC). The grep path is kept for callers that
+# have a used-names.txt and no map - tests/run.sh is one.
+declare -A USED_NAMES_MAP=()
+USED_NAMES_LOADED=0
+
 name_is_used() {
   local n="$1"
+  if [[ $USED_NAMES_LOADED -eq 1 ]]; then
+    [[ -n "${USED_NAMES_MAP[$n]+x}" ]] && return 0
+    urlencode_name "$n" >/dev/null
+    [[ "$URLENC" != "$n" && -n "${USED_NAMES_MAP[$URLENC]+x}" ]]
+    return
+  fi
   grep -qxF "$n" "$WORK/used-names.txt" && return 0
   local enc; enc=$(urlencode_name "$n")
   [[ "$enc" != "$n" ]] && grep -qxF "$enc" "$WORK/used-names.txt"
@@ -146,9 +194,15 @@ name_is_used() {
 
 # ------------------------------------------------------------- wp plumbing
 
+# mysqldump is in the list because `wp db export` shells out to it: without it
+# every row dump comes back empty, the dump gate refuses, and the whole
+# attachments class is skipped on every run - visible only as a runtime warn
+# buried in the log. comm is deliberately NOT in the list: the set difference
+# it was meant for is done with grep -qxF and an associative array, and
+# requiring a command the script never invokes turns a working VPS away.
 require_cmds() {
   local missing=() c
-  for c in wp mysql grep sed awk comm sort find stat sudo; do
+  for c in wp mysql mysqldump grep sed awk sort find stat sudo; do
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
   [[ ${#missing[@]} -eq 0 ]] || die "missing commands: ${missing[*]}"
@@ -200,6 +254,20 @@ load_site() {
   UPLOADS_DIR=$(wp_run eval '$u = wp_get_upload_dir(); echo $u["basedir"];' | tr -d '\r\n')
   [[ -d "$UPLOADS_DIR" ]] || { warn "  uploads directory not found ($UPLOADS_DIR), skipping"; return 1; }
 
+  # qmove records a quarantined file under "${src#$SITE_PATH/}", and
+  # restore_site puts it back at "$SITE_PATH/$rel". That is only a round trip
+  # while the uploads directory really is under the docroot as a string. An
+  # UPLOADS define pointing outside it, a shared multisite uploads directory
+  # or a symlinked release directory leaves the strip unmatched, $rel absolute,
+  # the file quarantined under files//var/www/... and restored to
+  # "$SITE_PATH//var/www/..." - a path mkdir -p creates without complaint,
+  # under an "[ok] restored" the operator has no reason to doubt. The check is
+  # textual on purpose: it is exactly the operation qmove performs.
+  [[ "$UPLOADS_DIR" == "$SITE_PATH"/* ]] || {
+    warn "  the uploads directory ($UPLOADS_DIR) is not inside the docroot ($SITE_PATH): quarantined paths would not be relative to the site and a restore would put them back in the wrong place, skipping"
+    return 1
+  }
+
   return 0
 }
 
@@ -245,8 +313,18 @@ for_each_site() {
 # One query per source rather than a single UNION: termmeta is missing on very
 # old installations and a plugin can leave a table unreadable, and neither
 # should cost us the whole haystack.
+#
+# Which failures are survivable is not a detail: a query that fails silently
+# strips references out of the haystack, and a missing reference is a false
+# "orphan" - the one direction every heuristic here is forbidden to err in.
+# posts, postmeta and options carry essentially every reference on a normal
+# site, so losing one of them is fatal for the site (return 1, the site is
+# reported as failed and nothing is classified). termmeta and usermeta are the
+# two that are genuinely optional - termmeta is missing on very old
+# installations - and only those two keep the warn-and-continue behaviour that
+# splitting the UNION into six queries was for.
 collect_haystack() {
-  local out="$WORK/haystack.txt" q
+  local out="$WORK/haystack.txt" i rc=0
   : > "$out"
   local -a queries=(
     "SELECT post_content FROM ${PREFIX}posts WHERE post_type <> 'attachment'"
@@ -256,9 +334,17 @@ collect_haystack() {
     "SELECT meta_value FROM ${PREFIX}termmeta"
     "SELECT meta_value FROM ${PREFIX}usermeta"
   )
-  for q in "${queries[@]}"; do
-    wp_run db query "$q" --skip-column-names >> "$out" \
-      || warn "  a haystack query failed, continuing: ${q:0:60}..."
+  # Same order as the array above: posts, posts, postmeta, options are
+  # required; termmeta and usermeta are not.
+  local -a required=(1 1 1 1 0 0)
+  for i in "${!queries[@]}"; do
+    wp_run db query "${queries[i]}" --skip-column-names >> "$out" && continue
+    if [[ "${required[i]}" -eq 1 ]]; then
+      warn "  a required haystack query failed, the haystack would be missing references: ${queries[i]:0:60}..."
+      rc=1
+    else
+      warn "  an optional haystack query failed, continuing: ${queries[i]:0:60}..."
+    fi
   done
 
   # No post_status filter above: drafts, revisions, scheduled posts and the
@@ -273,6 +359,7 @@ collect_haystack() {
   fi
 
   [[ -s "$out" ]] || warn "  the haystack is empty: every attachment would look unused"
+  return $rc
 }
 
 collect_inventory() {
@@ -300,7 +387,21 @@ collect_inventory() {
 # attachments that happen to generate a same-named size in different months
 # are otherwise indistinguishable; the thumbnail-attribution lookup in
 # quarantine_site matches on this column too so it cannot pick the wrong one.
+#
+# The eval loops get_post_meta() over every attachment on the site, so on a
+# large library with a low memory_limit or max_execution_time it can die
+# partway and still exit 0, leaving a PARTIAL map - which silently dooms the
+# thumbnails of every attachment after the point of death. A partial map is
+# indistinguishable from a complete one by inspection, so the PHP prints a
+# terminator after the loop: if the last line of the output is not that
+# terminator, the dump was cut short. That is exact rather than heuristic - no
+# row count against the attachment count, which cannot tell a truncated map
+# from a library of PDFs that legitimately generate no sizes.
+SIZEMAP_MARKER="__SIZEMAP_COMPLETE__"
+
 collect_size_map() {
+  local raw="$WORK/sizemap.raw"
+  SIZEMAP_COMPLETE=0
   wp_run eval '
     global $wpdb;
     $ids = $wpdb->get_col( "SELECT ID FROM {$wpdb->posts} WHERE post_type = \"attachment\"" );
@@ -326,7 +427,16 @@ collect_size_map() {
         echo $id . "\t" . $name . "\t" . $s["file"] . "\t" . $dir . "\n";
       }
     }
-  ' > "$WORK/sizemap.tsv" || warn "  cannot read the attachment metadata"
+    echo "__SIZEMAP_COMPLETE__\n";
+  ' > "$raw" || warn "  cannot read the attachment metadata"
+
+  if [[ -s "$raw" ]] && [[ "$(tail -n 1 "$raw")" == "$SIZEMAP_MARKER" ]]; then
+    SIZEMAP_COMPLETE=1
+  else
+    warn "  the attachment size map is truncated (no completion marker): PHP probably ran out of memory or time. The thumbs class is skipped this run - a partial size map makes every size of every attachment past the cut look like a forgotten leftover."
+  fi
+  grep -vxF "$SIZEMAP_MARKER" "$raw" > "$WORK/sizemap.tsv"
+  return 0
 }
 
 # Size NAMES, never dimensions. The filename carries the dimensions actually
@@ -341,24 +451,49 @@ collect_registered_sizes() {
   [[ -s "$WORK/registered.txt" ]] || warn "  no registered image size read, thumbnails will be left alone"
 }
 
+# ids.txt is the ONLY defence a bare-integer reference has: a _thumbnail_id or
+# an ACF image field never names its file anywhere in the haystack. classify()
+# already refuses to run the attachments class on an empty ids.txt - but that
+# guard does not fire when one of the two queries below fails and the other
+# still fills the file, which is the more likely failure and the more dangerous
+# one: the set comes back plausible and short, and every featured image whose
+# ID was in the missing half is reported as unused. Each query is therefore
+# checked on its own and $IDS_OK records the answer.
+#
+# Written to intermediate files rather than piped into one group: a `{ ... } |
+# sort` group runs in a subshell, so any flag set inside it is lost.
 collect_id_set() {
-  local out="$WORK/ids.txt"
-  {
-    # Shapes a query can pin down exactly: an ACF image field or a
-    # _thumbnail_id is the bare integer, a WooCommerce gallery a comma list.
-    wp_run db query "
+  local out="$WORK/ids.txt" raw="$WORK/ids-raw.txt"
+  IDS_OK=1
+  : > "$raw"
+
+  # Shapes a query can pin down exactly: an ACF image field or a
+  # _thumbnail_id is the bare integer, a WooCommerce gallery a comma list.
+  if wp_run db query "
       SELECT meta_value FROM ${PREFIX}postmeta
       WHERE meta_value REGEXP '^[0-9]+$' OR meta_value REGEXP '^[0-9]+(,[0-9]+)+$'
-    " --skip-column-names | expand_id_list
+    " --skip-column-names > "$WORK/ids-postmeta.txt"; then
+    expand_id_list < "$WORK/ids-postmeta.txt" >> "$raw"
+  else
+    IDS_OK=0
+    warn "  the postmeta ID query failed: featured images and ACF fields would look unreferenced"
+  fi
 
-    wp_run db query "
+  if wp_run db query "
       SELECT option_value FROM ${PREFIX}options
       WHERE option_name IN ('custom_logo','site_icon','site_logo')
-    " --skip-column-names | expand_id_list
+    " --skip-column-names > "$WORK/ids-options.txt"; then
+    expand_id_list < "$WORK/ids-options.txt" >> "$raw"
+  else
+    IDS_OK=0
+    warn "  the options ID query failed: the site logo and favicon would look unreferenced"
+  fi
 
-    # Everything else has to be recognised by its surrounding syntax.
-    extract_id_tokens < "$WORK/haystack.txt"
-  } | sort -u > "$out"
+  # Everything else has to be recognised by its surrounding syntax.
+  extract_id_tokens < "$WORK/haystack.txt" >> "$raw"
+
+  sort -u "$raw" > "$out"
+  return 0
 }
 
 # The pattern file grep matches the haystack against: one basename per line,
@@ -466,6 +601,19 @@ used_names() {
 
 classify() {
   used_names > "$WORK/used-names.txt"
+
+  # One pass over used-names.txt into a hash, instead of a grep that rescans
+  # the whole file once (twice, for a name whose encoded spelling differs) per
+  # candidate. name_is_used() reads the map when $USED_NAMES_LOADED is 1.
+  # Rebuilt from scratch on every call: classify() runs once per site.
+  USED_NAMES_MAP=()
+  USED_NAMES_LOADED=0
+  local k
+  while IFS= read -r k; do
+    [[ -n "$k" ]] && USED_NAMES_MAP["$k"]=1
+  done < "$WORK/used-names.txt"
+  USED_NAMES_LOADED=1
+
   : > "$WORK/doomed-attachments.tsv"
   : > "$WORK/doomed-orphans.txt"
   : > "$WORK/doomed-thumbs.txt"
@@ -482,13 +630,17 @@ classify() {
   if [[ "$ONLY_CLASS" == "all" || "$ONLY_CLASS" == "attachments" ]]; then
     if [[ ! -s "$WORK/ids.txt" ]]; then
       warn "  ids.txt is empty, skipping the attachments class this run"
+    elif [[ $IDS_OK -eq 0 ]]; then
+      # A non-empty ids.txt built from only some of its queries is worse than
+      # an empty one: it looks like a real answer. collect_id_set says so.
+      warn "  one of the ID queries failed, so ids.txt is incomplete: skipping the attachments class this run"
     else
       local id pdate parent rel base
       while IFS=$'\t' read -r id pdate parent rel; do
         [[ -n "$id" ]] || continue
         [[ "$pdate" < "$cutoff" ]] || continue
         [[ $KEEP_ATTACHED -eq 0 || "$parent" == "0" ]] || continue
-        base=$(basename "$rel")
+        base="${rel##*/}"
         name_is_used "$base" && continue
         grep -qxF "$id" "$WORK/ids.txt" && continue
         printf '%s\t%s\n' "$id" "$rel" >> "$WORK/doomed-attachments.tsv"
@@ -505,13 +657,13 @@ classify() {
     local id rel dir
     while IFS=$'\t' read -r id rel; do
       printf '%s\n' "$rel" >> "$WORK/doomed-attachment-files.txt"
-      dir=$(dirname "$rel")
-      # dirname prints "." for a root-level upload (uploads_use_yearmonth_folders
-      # off): drop it so the entry has no "./" prefix and matches $relf below
-      # exactly. The prefix is passed to awk as a variable rather than spliced
-      # into a sed replacement, so a directory name containing "|" or "&" is
-      # applied literally instead of being read as sed syntax.
-      [[ "$dir" == "." ]] && dir=""
+      # rel_dir gives "" rather than dirname's "." for a root-level upload
+      # (uploads_use_yearmonth_folders off), so the entry has no "./" prefix
+      # and matches $relf below exactly. The prefix is passed to awk as a
+      # variable rather than spliced into a sed replacement, so a directory
+      # name containing "|" or "&" is applied literally instead of being read
+      # as sed syntax.
+      rel_dir "$rel" >/dev/null; dir="$RELDIR"
       awk -F'\t' -v i="$id" -v pre="${dir:+$dir/}" '$1 == i { print pre $3 }' "$WORK/sizemap.tsv" \
         >> "$WORK/doomed-attachment-files.txt"
     done < "$WORK/doomed-attachments.tsv"
@@ -541,12 +693,36 @@ classify() {
   fi
   printf '__original\n__backup\n' >> "$WORK/live-sizes.txt"
 
-  # filename -> size name, for the thumbnails the metadata knows about. A
-  # single file can be shared by two registered sizes with identical
-  # dimensions, so this can hold several rows for the same filename.
-  awk -F'\t' '{ print $3 "\t" $2 }' "$WORK/sizemap.tsv" | sort -u > "$WORK/file-to-size.tsv"
+  # sizemap.tsv gets the same treatment as ids.txt and registered.txt, and for
+  # a worse reason. Both known-files.txt and names.txt are built from it, so an
+  # empty size map means no thumbnail is a known file AND no thumbnail name is
+  # in the grep pattern file that produces used-names.txt. Every
+  # "photo-150x150.jpg" then falls through to the "forgotten generated size"
+  # branch below - parse_thumb_size reduces it to "photo.jpg", which IS known -
+  # and EVERY thumbnail on the site is classified as stale. Under --apply that
+  # moves the lot, leaves thumb-sizes.tsv empty so the metadata is never
+  # updated, and 404s every srcset and every the_post_thumbnail() on the site.
+  # An empty map means the collector failed far more often than it means an
+  # attachment library that generates no sizes at all, and skipping the class
+  # costs nothing but a run.
+  if [[ -s "$WORK/inventory.tsv" && ! -s "$WORK/sizemap.tsv" ]]; then
+    thumbs_ok=0
+    warn "  the size map is empty while the site has attachments, skipping the thumbs class this run: without it every generated size on the site looks stale"
+  fi
+  # ... and the same again for a size map that is present but was cut short.
+  if [[ $SIZEMAP_COMPLETE -eq 0 ]]; then
+    thumbs_ok=0
+    warn "  the size map is incomplete, skipping the thumbs class this run"
+  fi
 
-  local f relf fname canon sizenames tbase text
+  # --only attachments produces nothing from the disk sweep - every branch
+  # below writes to doomed-orphans.txt or doomed-thumbs.txt - so on a 200k file
+  # tree it is a walk of the entire uploads directory for no output at all.
+  if [[ "$ONLY_CLASS" == "attachments" ]]; then
+    return 0
+  fi
+
+  local f relf fname
   local -a prune_names
   read -ra prune_names <<< "$EXCLUDE_UPLOAD_DIRS"
   local -a find_cmd=(find "$UPLOADS_DIR")
@@ -560,8 +736,48 @@ classify() {
   fi
   find_cmd+=(-type f -print)
 
+  # Everything the loop needs to ask a question of, hashed once. What this
+  # replaces, per file: a basename fork, one or two greps inside name_is_used,
+  # a grep over doomed-attachment-files.txt, a grep over known-files.txt, two
+  # command substitutions, and on the thumbs branch an awk, a sort and another
+  # grep - each of those greps rescanning its whole file. That is O(files x
+  # known) with five to eight forks a file, which is hours on a large tree and
+  # many minutes on a routine one; used_names() goes to the trouble of being a
+  # single Aho-Corasick pass and the loop right below it threw that away.
+  #
+  # No decision changes: every lookup below is the same question the grep asked
+  # (an exact whole-line match against the same file), and the two parse
+  # helpers are the same [[ =~ ]] they always were - only the $(...) around
+  # them is gone.
+  local -A known_map=() doomed_map=() live_map=() file_has_size=() file_live=()
+  while IFS= read -r k; do
+    [[ -n "$k" ]] && known_map["$k"]=1
+  done < "$WORK/known-files.txt"
+  while IFS= read -r k; do
+    [[ -n "$k" ]] && doomed_map["$k"]=1
+  done < "$WORK/doomed-attachment-files.txt"
+  while IFS= read -r k; do
+    [[ -n "$k" ]] && live_map["$k"]=1
+  done < "$WORK/live-sizes.txt"
+
+  # filename -> "has at least one size name" and "has at least one LIVE size
+  # name", which is all the thumbs branch ever asked file-to-size.tsv. A single
+  # file can be shared by two registered sizes with identical dimensions, so
+  # one filename can carry several rows here and any single live one keeps it.
+  local smname smfile
+  while IFS=$'\t' read -r _ smname smfile _; do
+    [[ -n "$smfile" ]] || continue
+    file_has_size["$smfile"]=1
+    [[ -n "${live_map[$smname]+x}" ]] && file_live["$smfile"]=1
+  done < "$WORK/sizemap.tsv"
+
+  # A silent walk of a large uploads tree is indistinguishable from a hang.
+  local n_scanned=0
+  log "  scanning $UPLOADS_DIR"
+
   while IFS= read -r f; do
-    fname=$(basename "$f")
+    n_scanned=$((n_scanned + 1))
+    fname="${f##*/}"
 
     # WordPress's own infrastructure files, never media: the index.php every
     # uploads/ directory ships with, and dotfiles such as the .htaccess that
@@ -575,9 +791,9 @@ classify() {
     name_is_used "$fname" && continue
 
     relf="${f#"$UPLOADS_DIR"/}"
-    grep -qxF "$relf" "$WORK/doomed-attachment-files.txt" && continue
+    [[ -n "${doomed_map[$relf]+x}" ]] && continue
 
-    if grep -qxF "$fname" "$WORK/known-files.txt"; then
+    if [[ -n "${known_map[$fname]+x}" ]]; then
       # Known to WordPress. Only a thumbnail stored under a size name that is
       # no longer registered can go -- and only when every size name mapped
       # to this filename is dead, since two live sizes with identical
@@ -585,24 +801,23 @@ classify() {
       [[ $thumbs_ok -eq 1 ]] || continue
       [[ "$ONLY_CLASS" == "all" || "$ONLY_CLASS" == "thumbs" ]] || continue
       parse_thumb_size "$fname" >/dev/null || continue
-      sizenames=$(awk -F'\t' -v n="$fname" '$1 == n { print $2 }' "$WORK/file-to-size.tsv" | sort -u)
-      [[ -n "$sizenames" ]] || continue
-      printf '%s\n' "$sizenames" | grep -qxFf - "$WORK/live-sizes.txt" && continue
+      [[ -n "${file_has_size[$fname]+x}" ]] || continue
+      [[ -n "${file_live[$fname]+x}" ]] && continue
       printf '%s\n' "$f" >> "$WORK/doomed-thumbs.txt"
       continue
     fi
 
     # Unknown to WordPress. A -scaled / -rotated / -e<timestamp> variant of a
     # known upload is not an orphan.
-    canon=$(canonical_original "$fname")
-    if [[ "$canon" != "$fname" ]] && grep -qxF "$canon" "$WORK/known-files.txt"; then
+    canonical_original "$fname" >/dev/null
+    if [[ "$CANON" != "$fname" ]] && [[ -n "${known_map[$CANON]+x}" ]]; then
       continue
     fi
 
     # A generated size of a live attachment that the metadata has forgotten:
     # a leftover from an earlier regeneration.
-    if IFS='|' read -r tbase _ text < <(parse_thumb_size "$fname"); then
-      if grep -qxF "$tbase.$text" "$WORK/known-files.txt"; then
+    if parse_thumb_size "$fname" >/dev/null; then
+      if [[ -n "${known_map[$THUMB_BASE.$THUMB_EXT]+x}" ]]; then
         [[ $thumbs_ok -eq 1 ]] || continue
         [[ "$ONLY_CLASS" == "all" || "$ONLY_CLASS" == "thumbs" ]] || continue
         printf '%s\n' "$f" >> "$WORK/doomed-thumbs.txt"
@@ -613,6 +828,9 @@ classify() {
     [[ "$ONLY_CLASS" == "all" || "$ONLY_CLASS" == "orphans" ]] || continue
     printf '%s\n' "$f" >> "$WORK/doomed-orphans.txt"
   done < <("${find_cmd[@]}" 2>/dev/null)
+
+  log "  scanned $n_scanned files under uploads"
+  return 0
 }
 
 # ---------------------------------------------------------------- report
@@ -641,11 +859,11 @@ report() {
     | sed "s|^|$UPLOADS_DIR/|" > "$WORK/att-files.txt"
   local id rel dir
   while IFS=$'\t' read -r id rel; do
-    dir=$(dirname "$rel")
-    # Same root-level case as classify()'s doomed-attachment-files.txt: drop
-    # the "." dirname gives for an upload with no directory component, so
-    # the two agree on which files exist under a doomed attachment.
-    [[ "$dir" == "." ]] && dir=""
+    # Same root-level case as classify()'s doomed-attachment-files.txt:
+    # rel_dir drops the "." dirname gives for an upload with no directory
+    # component, so the two agree on which files exist under a doomed
+    # attachment.
+    rel_dir "$rel" >/dev/null; dir="$RELDIR"
     awk -F'\t' -v i="$id" '$1 == i { print $3 }' "$WORK/sizemap.tsv" \
       | sed "s|^|$UPLOADS_DIR/${dir:+$dir/}|" >> "$WORK/att-files.txt"
   done < "$WORK/doomed-attachments.tsv"
@@ -667,9 +885,39 @@ report() {
   } >> "$LOG_FILE"
 
   if [[ $APPLY -eq 0 ]]; then
-    cut -f2 "$WORK/doomed-attachments.tsv" | head -5 | sed 's/^/    /'
-    head -5 "$WORK/doomed-orphans.txt" | sed 's/^/    /'
+    # One sample per class, labelled, all three in the same form. The thumbs
+    # class used to be missing here altogether - usually the largest count and
+    # the class where an operator most wants to eyeball what is about to move -
+    # and the two that were printed were run together with no labels in two
+    # different path forms, one relative to the uploads directory and one
+    # absolute. Absolute for all three: it is the form an operator can paste
+    # into ls or stat without first working out what it is relative to.
+    sample_class "attachments" "$n_att"   "$WORK/doomed-attachments.tsv"  tsv
+    sample_class "orphan files" "$n_orph" "$WORK/doomed-orphans.txt"      abs
+    sample_class "stale thumbs" "$n_thumb" "$WORK/doomed-thumbs.txt"      abs
     printf '  %sfull list in %s%s\n' "$c_dim" "$LOG_FILE" "$c_off"
+  fi
+}
+
+# sample_class <label> <count> <file> <tsv|abs>
+# Up to five paths from one doomed list, as absolute paths. "tsv" reads column
+# 2 of doomed-attachments.tsv, which is relative to the uploads directory;
+# "abs" reads a plain list that is already absolute.
+sample_class() {
+  local label="$1" n="$2" file="$3" form="$4" line
+  if [[ "$n" -eq 0 ]]; then
+    printf '    %s: none\n' "$label"
+    return 0
+  fi
+  printf '    %s (first %s of %s):\n' "$label" "$(( n < 5 ? n : 5 ))" "$n"
+  if [[ "$form" == "tsv" ]]; then
+    cut -f2 "$file" | head -5 | while IFS= read -r line; do
+      printf '      %s/%s\n' "${UPLOADS_DIR%/}" "$line"
+    done
+  else
+    head -5 "$file" | while IFS= read -r line; do
+      printf '      %s\n' "$line"
+    done
   fi
 }
 
@@ -684,8 +932,17 @@ clean_site() {
   collect_size_map
   collect_registered_sizes
   collect_names
-  collect_haystack
+  local haystack_ok=1
+  collect_haystack || haystack_ok=0
   collect_id_set
+
+  # A haystack missing one of its required sources is not a smaller haystack,
+  # it is a haystack with references removed from it, and every reference it
+  # lost turns some file into a false orphan. Nothing is classified from it.
+  if [[ $haystack_ok -eq 0 ]]; then
+    warn "  refusing to classify: the haystack is missing at least one required source"
+    return 1
+  fi
 
   if [[ ! -s "$WORK/inventory.tsv" ]]; then
     log "  no attachment found, nothing to do"
@@ -744,14 +1001,29 @@ prune_quarantine() {
   done
 }
 
+# Every exit from this function used to be `return 0`, so a run in which the
+# dump gate refused, or every move failed, or every `wp post delete` failed,
+# still put the site in OK, still printed "=== done: N ok, 0 failed ===" and
+# still exited 0. $rc is what makes the spec's "exit status is non-zero if any
+# site failed" true for the half of the program that actually moves files:
+# anything that did not happen but was supposed to sets it, and the return
+# carries it up through clean_site to main.
 quarantine_site() {
   QDIR="$QUARANTINE_ROOT/$SITE_SLUG/$STAMP"
-  mkdir -p "$QDIR/files" "$QDIR/rows"
-  : > "$QDIR/manifest.tsv"
+  local rc=0
+
+  if ! mkdir -p "$QDIR/files" "$QDIR/rows" 2>>"$LOG_FILE"; then
+    warn "  cannot create the quarantine directory $QDIR, nothing was moved"
+    return 1
+  fi
+  if ! : > "$QDIR/manifest.tsv"; then
+    warn "  cannot write the quarantine manifest $QDIR/manifest.tsv, nothing was moved"
+    return 1
+  fi
 
   local ids id rel dir fname f sname move_ok n_att_done
   local has_rows_posts has_rows_postmeta footer_posts footer_postmeta dump_ok
-  local thumb_ids thumb_dir
+  local thumb_ids thumb_dir n_orph_done n_thumb_done
 
   # --- attachments. Order matters: dump the rows, then move the files, then
   # let WordPress delete the post. Deleting first would take the files with it;
@@ -780,6 +1052,7 @@ quarantine_site() {
     dump_ok=0
     if [[ ! -s "$QDIR/rows/posts.sql" || ! -s "$QDIR/rows/postmeta.sql" ]]; then
       warn "  the row dump failed or is empty: attachments left untouched"
+      rc=1
     else
       grep -q '^INSERT INTO' "$QDIR/rows/posts.sql"    && has_rows_posts=1    || has_rows_posts=0
       grep -q '^INSERT INTO' "$QDIR/rows/postmeta.sql" && has_rows_postmeta=1 || has_rows_postmeta=0
@@ -788,8 +1061,10 @@ quarantine_site() {
 
       if [[ $has_rows_posts -eq 0 || $has_rows_postmeta -eq 0 ]]; then
         warn "  the row dump captured no rows: attachments left untouched"
+        rc=1
       elif [[ $footer_posts -ne $footer_postmeta ]]; then
         warn "  one row dump looks truncated (completion footer in one but not the other): attachments left untouched"
+        rc=1
       else
         [[ $footer_posts -eq 0 ]] && warn "  wp db export does not emit a completion footer here, proceeding on the INSERT check alone"
         dump_ok=1
@@ -799,13 +1074,19 @@ quarantine_site() {
     if [[ $dump_ok -eq 1 ]]; then
       n_att_done=0
       while IFS=$'\t' read -r id rel; do
-        dir=$(dirname "$rel")
+        rel_dir "$rel" >/dev/null; dir="$RELDIR"
         move_ok=1
         qmove "$UPLOADS_DIR/$rel" attachment "$id" || move_ok=0
-        # every generated size of this attachment
+        # every generated size of this attachment. "${dir:+$dir/}" rather than
+        # "$dir/": for a root-level upload $dir is empty, and the plain form
+        # would build ".../uploads//photo-150x150.jpg" - which opens the file
+        # perfectly well and then records that doubled slash in the manifest,
+        # where restore_chown_path would resolve its dirname to $UPLOADS_DIR
+        # itself and chown the uploads directory. Same normalisation as
+        # classify() and report(), from the same helper.
         while IFS= read -r fname; do
-          if [[ -f "$UPLOADS_DIR/$dir/$fname" ]]; then
-            qmove "$UPLOADS_DIR/$dir/$fname" attachment "$id" || move_ok=0
+          if [[ -f "$UPLOADS_DIR/${dir:+$dir/}$fname" ]]; then
+            qmove "$UPLOADS_DIR/${dir:+$dir/}$fname" attachment "$id" || move_ok=0
           fi
         done < <(awk -F'\t' -v i="$id" '$1 == i { print $3 }' "$WORK/sizemap.tsv")
         # A file that failed to move is still on disk and the row is still
@@ -816,9 +1097,11 @@ quarantine_site() {
             n_att_done=$((n_att_done + 1))
           else
             warn "  wp post delete $id failed, the row is still there"
+            rc=1
           fi
         else
           warn "  not every file for attachment $id moved, leaving the row in place"
+          rc=1
         fi
       done < "$WORK/doomed-attachments.tsv"
       # The count of lines in doomed-attachments.tsv is what was ELIGIBLE, not
@@ -829,9 +1112,21 @@ quarantine_site() {
   fi
 
   # --- orphan files: a move, nothing else. WordPress does not know them.
+  # The count is of moves that HAPPENED, not of lines in doomed-orphans.txt:
+  # that file says what was eligible, and a log that says "quarantined 4000
+  # orphan files" over four thousand failed moves is worse than no log at all.
+  # The attachments loop above already learned this; the lesson stops being
+  # learned in one place if the two loops three lines apart disagree.
   if [[ -s "$WORK/doomed-orphans.txt" ]]; then
-    while IFS= read -r f; do qmove "$f" orphan -; done < "$WORK/doomed-orphans.txt"
-    log "  quarantined $(wc -l < "$WORK/doomed-orphans.txt") orphan files"
+    n_orph_done=0
+    while IFS= read -r f; do
+      if qmove "$f" orphan -; then
+        n_orph_done=$((n_orph_done + 1))
+      else
+        rc=1
+      fi
+    done < "$WORK/doomed-orphans.txt"
+    log "  quarantined $n_orph_done orphan files"
   fi
 
   # --- stale thumbnails: move, then drop the size from the metadata. Leaving
@@ -839,25 +1134,28 @@ quarantine_site() {
   # every removed thumbnail into a 404.
   if [[ -s "$WORK/doomed-thumbs.txt" ]]; then
     : > "$WORK/thumb-sizes.tsv"
+    n_thumb_done=0
     while IFS= read -r f; do
-      fname=$(basename "$f")
+      fname="${f##*/}"
       # sizemap.tsv carries no directory in its filename column, so a
       # same-named size from two different attachments (two months' uploads
       # both producing photo-150x150.jpg, say) is only disambiguated by also
       # matching the attachment's own subdirectory, sizemap's 4th column,
       # against this thumbnail's actual directory on disk.
-      thumb_dir=$(dirname "${f#"$UPLOADS_DIR"/}")
-      [[ "$thumb_dir" == "." ]] && thumb_dir=""
+      rel_dir "${f#"$UPLOADS_DIR"/}" >/dev/null; thumb_dir="$RELDIR"
       id=$(awk -F'\t' -v n="$fname" -v d="$thumb_dir" '$3 == n && $4 == d { print $1; exit }' "$WORK/sizemap.tsv")
       sname=$(awk -F'\t' -v n="$fname" -v d="$thumb_dir" '$3 == n && $4 == d { print $2; exit }' "$WORK/sizemap.tsv")
-      qmove "$f" thumb "${id:--}" || continue
+      if ! qmove "$f" thumb "${id:--}"; then
+        rc=1
+        continue
+      fi
+      n_thumb_done=$((n_thumb_done + 1))
       [[ -n "$id" && -n "$sname" ]] && printf '%s\t%s\n' "$id" "$sname" >> "$WORK/thumb-sizes.tsv"
     done < "$WORK/doomed-thumbs.txt"
-    log "  quarantined $(wc -l < "$WORK/doomed-thumbs.txt") stale thumbnails"
+    # Again the count of what happened, not of what was eligible.
+    log "  quarantined $n_thumb_done stale thumbnails"
 
     if [[ -s "$WORK/thumb-sizes.tsv" ]]; then
-      cp "$WORK/thumb-sizes.tsv" "$QDIR/rows/thumb-sizes.tsv"
-
       # Capture the pre-edit metadata row too: unset() below only removes a
       # size name from the array, it does not tell us the file/width/height
       # that size once had, so without this dump the metadata edit is the one
@@ -872,7 +1170,36 @@ quarantine_site() {
         --where="post_id IN ($thumb_ids) AND meta_key='_wp_attachment_metadata'" \
         --no-create-info --skip-add-drop-table > "$QDIR/rows/thumb-postmeta.sql"
 
-      if grep -q '^INSERT INTO' "$QDIR/rows/thumb-postmeta.sql" 2>/dev/null; then
+      # One dump covers every affected ID at once, so a single surviving
+      # INSERT used to admit the unset() for ALL of them: a dump truncated
+      # partway left every later attachment with its metadata unset and no
+      # captured row to put back. Each ID is checked against the dump on its
+      # own, and only the corroborated ones are handed to the eval. mysqldump
+      # writes the row as (meta_id,post_id,'meta_key','meta_value'), so the ID
+      # is corroborated when ",<id>,'_wp_attachment_metadata'" appears in the
+      # dump. A quoting style this does not recognise reads as "not
+      # corroborated", which refuses the edit and leaves a reversible 404 -
+      # the safe direction.
+      : > "$WORK/thumb-sizes-ok.tsv"
+      local tid uncorroborated=0
+      while IFS= read -r tid; do
+        [[ -n "$tid" ]] || continue
+        if grep -qF ",$tid,'_wp_attachment_metadata'" "$QDIR/rows/thumb-postmeta.sql" 2>/dev/null \
+           || grep -qF ",$tid,\"_wp_attachment_metadata\"" "$QDIR/rows/thumb-postmeta.sql" 2>/dev/null; then
+          awk -F'\t' -v i="$tid" '$1 == i' "$WORK/thumb-sizes.tsv" >> "$WORK/thumb-sizes-ok.tsv"
+        else
+          uncorroborated=$((uncorroborated + 1))
+          warn "  the metadata dump does not corroborate attachment $tid: leaving its metadata untouched, its removed sizes will 404 in srcset but stay restorable"
+          rc=1
+        fi
+      done < <(cut -f1 "$WORK/thumb-sizes.tsv" | sort -u)
+
+      # rows/thumb-sizes.tsv is the record of the sizes actually unset, and it
+      # is what the eval reads: $WORK is a root-owned 0700 mktemp directory,
+      # unreadable by the site owner wp_run sudos to.
+      cp "$WORK/thumb-sizes-ok.tsv" "$QDIR/rows/thumb-sizes.tsv"
+
+      if [[ -s "$WORK/thumb-sizes-ok.tsv" ]]; then
         wp_run eval "
           \$rows = array_filter( explode( \"\n\", file_get_contents( '$QDIR/rows/thumb-sizes.tsv' ) ) );
           \$by_id = array();
@@ -886,9 +1213,13 @@ quarantine_site() {
             foreach ( \$sizes as \$s ) { unset( \$m['sizes'][ \$s ] ); }
             wp_update_attachment_metadata( \$id, \$m );
           }
-        " >/dev/null 2>&1 || warn "  cannot clean the thumbnail metadata, srcset may 404"
-      else
+        " >/dev/null 2>&1 || {
+          warn "  cannot clean the thumbnail metadata, srcset may 404"
+          rc=1
+        }
+      elif [[ $uncorroborated -eq 0 ]]; then
         warn "  cannot dump the pre-edit attachment metadata, leaving it untouched: stale srcset entries will 404 but stay reversible"
+        rc=1
       fi
     fi
   fi
@@ -903,15 +1234,39 @@ quarantine_site() {
     # say, with the dumps already on disk) the teardown simply does not
     # happen, instead of taking the only copy of those rows down with it.
     rm -f "$QDIR/manifest.tsv"
+    # qmove creates the files/wp-content/uploads/... skeleton with mkdir -p
+    # before it moves anything, so a run in which every move failed leaves an
+    # empty tree standing and the rmdir below correctly refuses to remove a
+    # non-empty directory. The husk that survives is then the newest entry
+    # under the site's quarantine directory, and the next successful run's
+    # prune_quarantine counts it towards KEEP_QUARANTINE and deletes the
+    # oldest REAL set to make room: a failed run silently costs a recovery
+    # point. -empty only ever removes directories that contain nothing, so it
+    # cannot touch a tree that still holds a quarantined file.
+    find "$QDIR/files" -type d -empty -delete 2>/dev/null
     rmdir "$QDIR/files" "$QDIR/rows" "$QDIR" 2>/dev/null
+    if [[ $rc -ne 0 ]]; then
+      # "Nothing to quarantine" and "nothing made it into quarantine" look
+      # identical from here - an empty manifest - and only one of them is good
+      # news. With $QUARANTINE_ROOT unwritable this is the branch the whole
+      # run ends in, and it used to end in it with an ok and exit 0.
+      warn "  nothing was quarantined: every operation failed (see the warnings above)"
+      return "$rc"
+    fi
     log "  nothing to quarantine"
     return 0
   fi
 
   cp "$LOG_FILE" "$QDIR/report.txt" 2>/dev/null
   ok "quarantine: $QDIR ($(wc -l < "$QDIR/manifest.tsv") items)"
+  # The whole safety story of this tool is that the move is reversible, and
+  # the one moment the operator is looking at the output is right now.
+  log "  restore it with: wp-media-clean.sh --restore $STAMP --site $SITE_NAME"
   prune_quarantine
-  return 0
+  if [[ $rc -ne 0 ]]; then
+    warn "  the quarantine pass finished with failures: it did not do everything it was asked to, see the warnings above"
+  fi
+  return "$rc"
 }
 
 # --------------------------------------------------------------- restore
