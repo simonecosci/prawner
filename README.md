@@ -232,7 +232,7 @@ can run all of them right now, with no WordPress needed:
 - `tests/run.sh` — 30 assertions over the pure string helpers (filename
   parsing, upload variants, URL encoding, reference-token extraction). No
   WordPress, no database.
-- `tests/classify.sh` — 87 assertions over `classify()` and the collectors:
+- `tests/classify.sh` — 106 assertions over `classify()` and the collectors:
   the classification rules themselves (upload variants, registered and
   deregistered sizes, a file shared by two size names, the excluded
   directories, the age cutoff, references by name and by ID) and the guards
@@ -255,7 +255,7 @@ bash tests/quarantine.sh
 bash tests/restore.sh
 ```
 
-Everything below is what those two suites cannot cover — real wp-cli output,
+Everything below is what those four suites cannot cover — real wp-cli output,
 real classification decisions on real data, real files. Work through this
 checklist on a real VPS — a test site, not production — before trusting
 `--apply` with data you care about.

@@ -254,6 +254,77 @@ assert_eq       "A3: b's thumbnail is not doomed"      "no" "$(doomed_thumb "202
 assert_eq       "A3: nothing at all is doomed"         "0"  "$(n_lines "$WORK/doomed-thumbs.txt")"
 assert_contains "A3: says the size map is incomplete"  "size map is incomplete" "$OUT"
 
+# The guards above skip the THUMBS class - and that is not enough, because the
+# size map is not one class's input. known-files.txt and names.txt are both
+# built from it, and those feed the orphans class too. A WordPress 5.3+
+# oversized upload is the case that shows it: the attached file is
+# "big-scaled.jpg" and the untouched "big.jpg" exists on disk only as the map's
+# __original row. With the map gone, "big.jpg" is not a known file,
+# canonical_original cannot rescue it (it strips -scaled, and the name on disk
+# has no suffix), and it lands in doomed-orphans.txt together with every
+# generated size - live images called orphans, under a return of 0. An
+# untrustworthy size map is therefore fatal for the SITE, not for one class.
+new_case "A4: an empty, unmarked size map refuses the site instead of orphaning a -scaled upload"
+inv 1 "$OLD_DATE" 0 "2024/01/big-scaled.jpg"
+registered thumbnail medium
+att_ids 1
+upload "2024/01/big-scaled.jpg"
+upload "2024/01/big.jpg"                  # the untouched original: __original only
+upload "2024/01/big-150x150.jpg"
+upload "2024/01/big-300x200.jpg"
+# sizemap.tsv is left empty AND the collector never emitted its marker.
+SIZEMAP_COMPLETE=0
+run_classify
+
+assert_eq       "A4: the site is refused"                  "1"  "$RC"
+assert_contains "A4: says it is refusing, and why"         "refusing to classify: the size map is empty" "$OUT"
+assert_eq       "A4: the untouched original is not an orphan"   "no" "$(doomed_orph "2024/01/big.jpg")"
+assert_eq       "A4: the 150x150 size is not an orphan"         "no" "$(doomed_orph "2024/01/big-150x150.jpg")"
+assert_eq       "A4: the 300x200 size is not an orphan"         "no" "$(doomed_orph "2024/01/big-300x200.jpg")"
+assert_eq       "A4: nothing at all is doomed as an orphan"     "0"  "$(n_lines "$WORK/doomed-orphans.txt")"
+assert_eq       "A4: the uploads tree was never even walked"    "no" "$(walked)"
+
+# The same with a map that is present but was cut short: attachment 1's rows
+# made it out of PHP, attachment 2's did not.
+new_case "A5: a truncated size map refuses the site too"
+inv 1 "$OLD_DATE" 0 "2024/01/a-scaled.jpg"
+inv 2 "$OLD_DATE" 0 "2024/01/b-scaled.jpg"
+size 1 __original "a.jpg" "2024/01"
+size 1 thumbnail  "a-150x150.jpg" "2024/01"
+# attachment 2's rows never made it out of PHP: no __original, no sizes.
+registered thumbnail
+att_ids 1 2
+upload "2024/01/a-scaled.jpg"; upload "2024/01/a.jpg"; upload "2024/01/a-150x150.jpg"
+upload "2024/01/b-scaled.jpg"; upload "2024/01/b.jpg"; upload "2024/01/b-150x150.jpg"
+SIZEMAP_COMPLETE=0
+run_classify
+
+assert_eq       "A5: the site is refused"                    "1"  "$RC"
+assert_contains "A5: the wording still says incomplete, not empty" \
+                "refusing to classify: the size map is incomplete" "$OUT"
+assert_eq       "A5: b's untouched original is not an orphan" "no" "$(doomed_orph "2024/01/b.jpg")"
+assert_eq       "A5: b's thumbnail is not an orphan"          "no" "$(doomed_orph "2024/01/b-150x150.jpg")"
+assert_eq       "A5: nothing at all is doomed as an orphan"   "0"  "$(n_lines "$WORK/doomed-orphans.txt")"
+
+# The refusal must fire on "the collector failed", never on "there is nothing
+# to map" - a library of PDFs generates no sizes at all and its size map is
+# legitimately empty. The completion marker is exactly what separates the two,
+# and it is why collect_size_map prints one. This case guards against a fix
+# that refuses on emptiness instead: the site carries on, and the thumbs class
+# is skipped by the class-level guard as it was before.
+new_case "A6: an empty size map that DID emit its marker is not refused"
+inv 1 "$OLD_DATE" 0 "2024/01/manual.pdf"
+registered thumbnail medium
+att_ids 1
+upload "2024/01/manual.pdf"
+# sizemap.tsv is empty, but SIZEMAP_COMPLETE stays 1: the dump ran to the end.
+run_classify
+
+assert_eq           "A6: the site is not refused"           "0"   "$RC"
+assert_not_contains "A6: and nothing says it refused"       "refusing to classify" "$OUT"
+assert_eq           "A6: the run still walked the tree"     "yes" "$(walked)"
+assert_contains     "A6: the thumbs class is still skipped" "skipping the thumbs class" "$OUT"
+
 # ================================= B. the completeness marker itself
 
 # The truncation above is only detectable because the PHP prints a terminator

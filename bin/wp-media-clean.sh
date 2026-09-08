@@ -433,7 +433,7 @@ collect_size_map() {
   if [[ -s "$raw" ]] && [[ "$(tail -n 1 "$raw")" == "$SIZEMAP_MARKER" ]]; then
     SIZEMAP_COMPLETE=1
   else
-    warn "  the attachment size map is truncated (no completion marker): PHP probably ran out of memory or time. The thumbs class is skipped this run - a partial size map makes every size of every attachment past the cut look like a forgotten leftover."
+    warn "  the attachment size map is truncated (no completion marker): PHP probably ran out of memory or time. The site is refused this run - a partial size map makes every size of every attachment past the cut look like a forgotten leftover, and the untouched original of every -scaled upload past the cut look like an orphan."
   fi
   grep -vxF "$SIZEMAP_MARKER" "$raw" > "$WORK/sizemap.tsv"
   return 0
@@ -619,6 +619,41 @@ classify() {
   : > "$WORK/doomed-thumbs.txt"
   : > "$WORK/doomed-attachment-files.txt"
 
+  # sizemap.tsv is not one class's input, it is the site's. Both
+  # known-files.txt and names.txt are built from it, and those two feed every
+  # remaining class: the orphans branch asks known-files.txt "does WordPress
+  # know this file?", and used-names.txt - the protection every file has -
+  # comes from grepping the haystack with names.txt. So a size map the
+  # collector could not be trusted to finish cannot be handled by skipping one
+  # class. A WordPress 5.3+ oversized upload is the clearest case: the attached
+  # file is "photo-scaled.jpg" and the untouched "photo.jpg" exists on disk
+  # only as the map's __original row, so with the map missing neither
+  # "photo.jpg" nor any of its generated sizes is a known file,
+  # canonical_original cannot help (it strips -scaled, and the name on disk
+  # carries no suffix), and the whole set lands in doomed-orphans.txt - live
+  # images, reported as orphans, under an exit status of 0.
+  #
+  # Untrustworthy therefore means fatal for the site, exactly as a failed
+  # required haystack query is: clean_site turns this into the same refusal,
+  # the site is reported as FAILED and the run exits non-zero.
+  #
+  # $SIZEMAP_COMPLETE is the whole of the test, and it is exact rather than
+  # heuristic: collect_size_map's PHP prints a terminator after its loop, so
+  # the marker is present if and only if the dump ran to the end. Emptiness
+  # only chooses the wording - an operator needs to know whether the collector
+  # produced nothing at all or died partway. An empty map that DID emit its
+  # marker is the legitimate "this library generates no sizes" case and is not
+  # refused; the class-level guard further down still skips the thumbs class
+  # for it.
+  if [[ $SIZEMAP_COMPLETE -eq 0 ]]; then
+    if [[ -s "$WORK/sizemap.tsv" ]]; then
+      warn "  refusing to classify: the size map is incomplete (the collector emitted no completion marker), and both known-files.txt and names.txt are built from it, so every class would see live files as unknown"
+    else
+      warn "  refusing to classify: the size map is empty and the collector emitted no completion marker, and both known-files.txt and names.txt are built from it, so every class would see live files as unknown"
+    fi
+    return 1
+  fi
+
   local cutoff
   cutoff=$(date -d "-${MIN_AGE_DAYS} days" '+%Y-%m-%d %H:%M:%S')
 
@@ -693,26 +728,20 @@ classify() {
   fi
   printf '__original\n__backup\n' >> "$WORK/live-sizes.txt"
 
-  # sizemap.tsv gets the same treatment as ids.txt and registered.txt, and for
-  # a worse reason. Both known-files.txt and names.txt are built from it, so an
-  # empty size map means no thumbnail is a known file AND no thumbnail name is
-  # in the grep pattern file that produces used-names.txt. Every
-  # "photo-150x150.jpg" then falls through to the "forgotten generated size"
-  # branch below - parse_thumb_size reduces it to "photo.jpg", which IS known -
-  # and EVERY thumbnail on the site is classified as stale. Under --apply that
-  # moves the lot, leaves thumb-sizes.tsv empty so the metadata is never
-  # updated, and 404s every srcset and every the_post_thumbnail() on the site.
-  # An empty map means the collector failed far more often than it means an
-  # attachment library that generates no sizes at all, and skipping the class
-  # costs nothing but a run.
+  # A size map that emitted its completion marker but is still empty is the one
+  # trustworthy way of being empty: the library genuinely generates no sizes
+  # (PDFs, SVGs, audio). The site is not refused for it - the refusal above
+  # deliberately does not fire - but the thumbs class is still skipped, because
+  # with no size map row anywhere every "photo-150x150.jpg" on disk would reach
+  # the "forgotten generated size" branch below, where parse_thumb_size reduces
+  # it to "photo.jpg", which IS known, and the whole site's thumbnails would be
+  # classified as stale. Under --apply that moves the lot, leaves
+  # thumb-sizes.tsv empty so the metadata is never updated, and 404s every
+  # srcset and every the_post_thumbnail() on the site. Skipping the class costs
+  # nothing but a run.
   if [[ -s "$WORK/inventory.tsv" && ! -s "$WORK/sizemap.tsv" ]]; then
     thumbs_ok=0
     warn "  the size map is empty while the site has attachments, skipping the thumbs class this run: without it every generated size on the site looks stale"
-  fi
-  # ... and the same again for a size map that is present but was cut short.
-  if [[ $SIZEMAP_COMPLETE -eq 0 ]]; then
-    thumbs_ok=0
-    warn "  the size map is incomplete, skipping the thumbs class this run"
   fi
 
   # --only attachments produces nothing from the disk sweep - every branch
@@ -953,7 +982,12 @@ clean_site() {
     return 1
   fi
 
-  classify
+  # classify() refuses the site outright when a collector its output cannot be
+  # separated from came back untrustworthy - today that is the size map, which
+  # feeds known-files.txt and names.txt and so every class. Same treatment as
+  # the two haystack refusals above: nothing is reported, nothing is moved, the
+  # site lands in FAILED and the run exits non-zero.
+  classify || return 1
   report
 
   [[ $APPLY -eq 1 ]] || return 0
