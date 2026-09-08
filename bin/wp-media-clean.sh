@@ -398,7 +398,9 @@ Options:
   --min-age <days>     ignore attachments newer than this (default 30)
   --keep-attached      treat post_parent <> 0 as in use
   --no-scan-files      skip the grep over themes and plugins
-  --list-quarantine    list the available quarantine sets
+  --list-quarantine    list the available quarantine sets (needs a loadable
+                       site: wp-cli must reach the database, so a site whose
+                       DB is down will not show its quarantine sets here)
   --restore <stamp>    restore a quarantine set (requires --site)
   -h, --help           this help
 
@@ -904,6 +906,70 @@ quarantine_site() {
   return 0
 }
 
+# --------------------------------------------------------------- restore
+
+list_quarantine_site() {
+  local site_dir="$QUARANTINE_ROOT/$SITE_SLUG" d n
+  [[ -d "$site_dir" ]] || { log "  no quarantine set"; return 0; }
+  for d in "$site_dir"/*/; do
+    [[ -d "$d" ]] || continue
+    n=$(wc -l < "$d/manifest.tsv" 2>/dev/null || echo 0)
+    log "  $(basename "$d")  $n items  $(du -sh "$d" 2>/dev/null | cut -f1)"
+  done
+}
+
+restore_site() {
+  local qdir="$QUARANTINE_ROOT/$SITE_SLUG/$RESTORE_STAMP"
+  [[ -d "$qdir" ]] || { warn "  no quarantine set $RESTORE_STAMP for this site"; return 1; }
+
+  # A missing or empty manifest is not an error: quarantine_site's own
+  # teardown removes an empty manifest.tsv while leaving a populated rows/
+  # behind it (every file move failed but the row dumps already landed), so
+  # that combination is reachable and legitimate. It just means there is
+  # nothing to move back; the row import below still runs.
+  local class rel att conflicts=0
+  if [[ -s "$qdir/manifest.tsv" ]]; then
+    # Refuse rather than overwrite: a destination that already exists means
+    # something was re-uploaded since, and clobbering it would be a second
+    # data loss on top of whatever made the restore necessary. Check every
+    # conflict before moving anything, so a partial restore never happens.
+    while IFS=$'\t' read -r class rel att; do
+      [[ -e "$SITE_PATH/$rel" ]] && { warn "  conflict, already present: $rel"; conflicts=$((conflicts + 1)); }
+    done < "$qdir/manifest.tsv"
+    [[ $conflicts -eq 0 ]] || { warn "  $conflicts conflicts, restore aborted"; return 1; }
+
+    while IFS=$'\t' read -r class rel att; do
+      mkdir -p "$(dirname "$SITE_PATH/$rel")"
+      mv -n "$qdir/files/$rel" "$SITE_PATH/$rel" || warn "  cannot restore $rel"
+    done < "$qdir/manifest.tsv"
+
+    chown -R "$SITE_OWNER":"$SITE_GROUP" "$SITE_PATH/wp-content/uploads" 2>/dev/null
+  else
+    log "  no manifest (or it is empty): nothing to move back, importing rows only"
+  fi
+
+  # Files first, then rows: a failure between the two leaves files present and
+  # rows absent, which is recoverable by re-running the restore.
+  #
+  # thumb-postmeta.sql carries the pre-edit _wp_attachment_metadata for
+  # attachments whose stale thumbnails were removed; posts.sql/postmeta.sql
+  # carry every row of a restored attachment, _wp_attachment_metadata
+  # included. Importing all three restores the metadata exactly as it was, so
+  # there is nothing left for `wp media regenerate` to do afterwards -
+  # running it here would rewrite metadata down to only the currently
+  # registered sizes and undo the very entries this import just restored.
+  local f
+  for f in "$qdir"/rows/posts.sql "$qdir"/rows/postmeta.sql "$qdir"/rows/thumb-postmeta.sql; do
+    [[ -s "$f" ]] || continue
+    log "  importing $(basename "$f")"
+    wp_run db import "$f" >/dev/null || warn "  cannot import $(basename "$f")"
+  done
+
+  ok "restored $qdir into $SITE_PATH"
+  log "  the quarantine set is left in place: remove it by hand once you are satisfied"
+  return 0
+}
+
 main() {
   parse_args "$@"
   [[ $EUID -eq 0 ]] || die "root required (use sudo)"
@@ -912,8 +978,20 @@ main() {
   LOG_FILE="$LOG_DIR/$STAMP.log"
 
   case "$ACTION" in
-    list-quarantine) die "not implemented yet" ;;
-    restore)         die "not implemented yet" ;;
+    list-quarantine)
+      log "=== quarantine sets ==="
+      local site_rc=0
+      for_each_site list_quarantine_site || site_rc=$?
+      [[ ${#FAILED[@]} -eq 0 ]] || warn "sites with problems: ${FAILED[*]}"
+      [[ ${#FAILED[@]} -eq 0 && $site_rc -eq 0 ]]
+      ;;
+    restore)
+      log "=== restore $RESTORE_STAMP ==="
+      local site_rc=0
+      for_each_site restore_site || site_rc=$?
+      [[ ${#FAILED[@]} -eq 0 ]] || warn "sites with problems: ${FAILED[*]}"
+      [[ ${#FAILED[@]} -eq 0 && $site_rc -eq 0 ]]
+      ;;
     clean)
       log "=== wp-media-clean start (apply=$APPLY, only=$ONLY_CLASS) ==="
       local site_rc=0
